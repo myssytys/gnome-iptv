@@ -1,0 +1,10 @@
+build/
+*.m3u
+*.m3u8
+*.db
+*.ts
+*.mkv
+*.o
+*.swp
+*~
+.DS_Store
