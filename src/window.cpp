@@ -14,33 +14,6 @@ namespace iptv {
 
 namespace {
 
-std::string to_lower_copy(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return s;
-}
-
-bool contains_ci_lower_needle(std::string_view haystack, std::string_view lower_needle) {
-    if (lower_needle.empty()) return true;
-    if (haystack.size() < lower_needle.size()) return false;
-    const size_t limit = haystack.size() - lower_needle.size();
-    const unsigned char first_c = static_cast<unsigned char>(lower_needle[0]);
-    for (size_t i = 0; i <= limit; ++i) {
-        if (static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(haystack[i]))) == first_c) {
-            bool match = true;
-            for (size_t j = 1; j < lower_needle.size(); ++j) {
-                if (static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(haystack[i + j]))) !=
-                    static_cast<unsigned char>(lower_needle[j])) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) return true;
-        }
-    }
-    return false;
-}
-
 std::string format_bytes(uint64_t bytes) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(1);
@@ -79,14 +52,15 @@ struct MainWindow::Impl {
     StreamPlayer player;
     StreamRecorder recorder;
 
-    // Data state
-    std::vector<Channel> all_channels;
-    std::vector<Channel> filtered_channels;
+    // Data state (file-offset indexed; channels are loaded into memory only as they approach the scroller)
+    static constexpr size_t SCROLLER_BATCH_SIZE = 60;
+    M3uPlaylistIndex playlist_index;
+    std::vector<uint32_t> matching_slot_indices;
+    std::vector<Channel> loaded_scroller_channels;
     std::vector<std::string> group_names;
-    std::unordered_map<std::string, size_t> channel_by_name_idx;
-    std::unordered_map<std::string, size_t> channel_by_id_idx;
     Channel selected_channel;
     bool has_selected_channel = false;
+    size_t selected_matching_pos = 0;
 
     // Sidebar widgets
     GtkEntry* m3u_url_entry = nullptr;
@@ -97,6 +71,7 @@ struct MainWindow::Impl {
     GtkLabel* epg_timer_countdown_label = nullptr;
     GtkSearchEntry* channel_search_entry = nullptr;
     GtkDropDown* group_dropdown = nullptr;
+    GtkScrolledWindow* channel_scrolled_window = nullptr;
     GtkListBox* channel_list_box = nullptr;
     GtkLabel* epg_footer_label = nullptr;
 
@@ -154,7 +129,7 @@ struct MainWindow::Impl {
         config_store.save(config);
 
         epg_manager = new EpgManager(config_store.db_path());
-        epg_manager->set_active_channels(all_channels);
+        epg_manager->set_active_channels({});
         player.configure(config);
         recorder.configure(config);
 
@@ -255,37 +230,37 @@ struct MainWindow::Impl {
     }
 
     void step_channel(int delta) {
-        const auto& list = !filtered_channels.empty() ? filtered_channels : all_channels;
-        if (list.empty()) return;
+        if (matching_slot_indices.empty()) return;
 
-        size_t current_idx = 0;
-        bool found = false;
+        size_t next_pos = 0;
         if (has_selected_channel) {
-            for (size_t i = 0; i < list.size(); ++i) {
-                if (list[i].stream_url == selected_channel.stream_url &&
-                    list[i].name == selected_channel.name) {
-                    current_idx = i;
-                    found = true;
-                    break;
+            int n = static_cast<int>(matching_slot_indices.size());
+            int target = (static_cast<int>(selected_matching_pos) + delta) % n;
+            if (target < 0) target += n;
+            next_pos = static_cast<size_t>(target);
+        }
+
+        // If stepping forward approaches the end of currently loaded scroller channels, load the next batch
+        if (next_pos >= loaded_scroller_channels.size() &&
+            next_pos < loaded_scroller_channels.size() + SCROLLER_BATCH_SIZE) {
+            load_more_channels_into_scroller(SCROLLER_BATCH_SIZE);
+        }
+
+        selected_matching_pos = next_pos;
+        if (next_pos < loaded_scroller_channels.size()) {
+            if (channel_list_box) {
+                if (GtkListBoxRow* row = gtk_list_box_get_row_at_index(channel_list_box, static_cast<int>(next_pos))) {
+                    gtk_list_box_select_row(channel_list_box, row);
+                    gtk_widget_grab_focus(GTK_WIDGET(row));
                 }
             }
-        }
-
-        size_t next_idx = 0;
-        if (found) {
-            int n = static_cast<int>(list.size());
-            int target = (static_cast<int>(current_idx) + delta) % n;
-            if (target < 0) target += n;
-            next_idx = static_cast<size_t>(target);
-        }
-
-        if (channel_list_box) {
-            if (GtkListBoxRow* row = gtk_list_box_get_row_at_index(channel_list_box, static_cast<int>(next_idx))) {
-                gtk_list_box_select_row(channel_list_box, row);
-                gtk_widget_grab_focus(GTK_WIDGET(row));
+            select_and_play_channel(loaded_scroller_channels[next_pos]);
+        } else {
+            Channel ch = M3uParser::load_channel_at_slot(playlist_index, matching_slot_indices[next_pos]);
+            if (!ch.stream_url.empty()) {
+                select_and_play_channel(ch);
             }
         }
-        select_and_play_channel(list[next_idx]);
     }
 
     void step_epg_programme(int delta) {
@@ -653,8 +628,9 @@ struct MainWindow::Impl {
             this);
         gtk_box_append(GTK_BOX(sidebar_box), GTK_WIDGET(group_dropdown));
 
-        // Scrollable channel list
+        // Scrollable channel list with on-demand scroller proximity loading
         GtkWidget* ch_scroll = gtk_scrolled_window_new();
+        channel_scrolled_window = GTK_SCROLLED_WINDOW(ch_scroll);
         gtk_widget_set_vexpand(ch_scroll, TRUE);
         channel_list_box = GTK_LIST_BOX(gtk_list_box_new());
         gtk_widget_add_css_class(GTK_WIDGET(channel_list_box), "navigation-sidebar");
@@ -665,12 +641,31 @@ struct MainWindow::Impl {
                 auto* self = static_cast<Impl*>(data);
                 if (!row) return;
                 int idx = gtk_list_box_row_get_index(row);
-                if (idx >= 0 && static_cast<size_t>(idx) < self->filtered_channels.size()) {
-                    self->select_and_play_channel(self->filtered_channels[static_cast<size_t>(idx)]);
+                if (idx >= 0 && static_cast<size_t>(idx) < self->loaded_scroller_channels.size()) {
+                    self->selected_matching_pos = static_cast<size_t>(idx);
+                    self->select_and_play_channel(self->loaded_scroller_channels[static_cast<size_t>(idx)]);
                 }
             }),
             this);
         gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(ch_scroll), GTK_WIDGET(channel_list_box));
+
+        // Load additional channels into memory from disk as the user scrolls near the bottom of the scroller
+        GtkAdjustment* ch_vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(ch_scroll));
+        if (ch_vadj) {
+            g_signal_connect(
+                ch_vadj, "value-changed",
+                G_CALLBACK(+[](GtkAdjustment* adj, gpointer data) {
+                    auto* self = static_cast<Impl*>(data);
+                    double val = gtk_adjustment_get_value(adj);
+                    double page = gtk_adjustment_get_page_size(adj);
+                    double upper = gtk_adjustment_get_upper(adj);
+                    double threshold = std::max(450.0, page * 2.5);
+                    if (val + page >= upper - threshold) {
+                        self->load_more_channels_into_scroller(SCROLLER_BATCH_SIZE);
+                    }
+                }),
+                this);
+        }
         gtk_box_append(GTK_BOX(sidebar_box), ch_scroll);
 
         epg_footer_label = GTK_LABEL(gtk_label_new("EPG: Not loaded yet"));
@@ -1297,29 +1292,24 @@ struct MainWindow::Impl {
         gtk_widget_set_sensitive(GTK_WIDGET(connect_btn), FALSE);
         gtk_button_set_label(connect_btn, "Loading...");
 
-        m3u_parser.fetch_and_parse_async(url, [this](M3uParseResult res) {
+        std::string cache_path = config_store.data_dir() + "/playlist_cache.m3u";
+        m3u_parser.fetch_and_index_async(url, cache_path, [this](M3uPlaylistIndex idx) {
             gtk_widget_set_sensitive(GTK_WIDGET(connect_btn), TRUE);
             gtk_button_set_label(connect_btn, "Load M3U");
 
-            if (!res.success) {
-                show_toast("M3U Error: " + res.error_message);
+            if (!idx.success) {
+                show_toast("M3U Error: " + idx.error_message);
                 return;
             }
 
-            all_channels = std::move(res.channels);
-            channel_by_name_idx.clear();
-            channel_by_id_idx.clear();
-            for (size_t i = 0; i < all_channels.size(); ++i) {
-                const auto& ch = all_channels[i];
-                if (!ch.name.empty()) {
-                    channel_by_name_idx.try_emplace(ch.name, i);
-                }
-                if (!ch.id.empty() && ch.id != ch.name) {
-                    channel_by_id_idx.try_emplace(to_lower_copy(ch.id), i);
-                }
-            }
-            epg_manager->set_active_channels(all_channels);
-            show_toast("Connected: Loaded " + std::to_string(all_channels.size()) + " channel(s).");
+            playlist_index = std::move(idx);
+            epg_manager->set_active_channels(playlist_index.epg_channels);
+            // Release temporary EPG bootstrap descriptors now that SQLite has synced them
+            playlist_index.epg_channels.clear();
+            playlist_index.epg_channels.shrink_to_fit();
+
+            show_toast("Connected: Indexed " + std::to_string(playlist_index.slots.size()) +
+                       " channel(s) for on-demand scroller loading.");
 
             if (epg_manager->total_programmes() > 0) {
                 std::string footer = "EPG: " + std::to_string(epg_manager->total_programmes()) +
@@ -1328,34 +1318,30 @@ struct MainWindow::Impl {
             }
 
             // If M3U header or Xtream Codes URL provided an EPG URL and user has no EPG URL set, adopt it
-            if (!res.discovered_epg_url.empty() && config.epg_url.empty()) {
-                load_epg_from_url(res.discovered_epg_url, true);
+            if (!playlist_index.discovered_epg_url.empty() && config.epg_url.empty()) {
+                load_epg_from_url(playlist_index.discovered_epg_url, true);
             }
 
             rebuild_groups_dropdown();
             rebuild_channel_list();
             rebuild_global_epg_search();
 
-            // Auto-select and play the first channel if only 1 channel or none selected yet
-            if (!all_channels.empty() && !has_selected_channel) {
-                select_and_play_channel(all_channels.front());
+            // Auto-select and play the first channel if none selected yet
+            if (!loaded_scroller_channels.empty() && !has_selected_channel) {
+                selected_matching_pos = 0;
+                select_and_play_channel(loaded_scroller_channels.front());
             }
         });
     }
 
     void rebuild_groups_dropdown() {
-        std::set<std::string> unique_groups;
-        for (const auto& ch : all_channels) {
-            if (!ch.group.empty()) unique_groups.insert(ch.group);
-        }
-
-        group_names.clear();
-        group_names.push_back("All Groups");
-        for (const auto& g : unique_groups) {
-            group_names.push_back(g);
+        group_names = playlist_index.groups;
+        if (group_names.empty()) {
+            group_names.push_back("All Groups");
         }
 
         std::vector<const char*> c_strs;
+        c_strs.reserve(group_names.size() + 1);
         for (const auto& g : group_names) c_strs.push_back(g.c_str());
         c_strs.push_back(nullptr);
 
@@ -1367,79 +1353,85 @@ struct MainWindow::Impl {
         suppress_group_signal = false;
     }
 
-    void rebuild_channel_list() {
-        clear_list_box(channel_list_box);
-        filtered_channels.clear();
+    void append_channel_row_widget(const Channel& ch, bool has_epg) {
+        GtkWidget* row_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+        gtk_widget_set_margin_start(row_box, 8);
+        gtk_widget_set_margin_end(row_box, 8);
+        gtk_widget_set_margin_top(row_box, 6);
+        gtk_widget_set_margin_bottom(row_box, 6);
 
-        const char* q_raw = gtk_editable_get_text(GTK_EDITABLE(channel_search_entry));
-        std::string query = to_lower_copy(q_raw ? q_raw : "");
+        std::string title = std::to_string(ch.number) + ". " + ch.name;
+        GtkWidget* name_lbl = gtk_label_new(title.c_str());
+        gtk_widget_set_halign(name_lbl, GTK_ALIGN_START);
+        gtk_label_set_ellipsize(GTK_LABEL(name_lbl), PANGO_ELLIPSIZE_END);
+        gtk_widget_add_css_class(name_lbl, "heading");
+        gtk_box_append(GTK_BOX(row_box), name_lbl);
 
-        guint grp_idx = gtk_drop_down_get_selected(group_dropdown);
-        std::string selected_grp = (grp_idx > 0 && grp_idx < group_names.size())
-                                       ? group_names[grp_idx]
-                                       : "";
+        EpgProgramme now_p{};
+        EpgProgramme next_p{};
+        if (has_epg && epg_manager->get_now_and_next(ch, now_p, next_p)) {
+            std::string sub = "Now: " + now_p.title + " (" + now_p.formatted_time_range() + ")";
+            GtkWidget* epg_lbl = gtk_label_new(sub.c_str());
+            gtk_widget_set_halign(epg_lbl, GTK_ALIGN_START);
+            gtk_label_set_ellipsize(GTK_LABEL(epg_lbl), PANGO_ELLIPSIZE_END);
+            gtk_widget_add_css_class(epg_lbl, "caption");
+            gtk_widget_add_css_class(epg_lbl, "dim-label");
+            gtk_box_append(GTK_BOX(row_box), epg_lbl);
+        } else {
+            GtkWidget* grp_lbl = gtk_label_new(ch.group.c_str());
+            gtk_widget_set_halign(grp_lbl, GTK_ALIGN_START);
+            gtk_widget_add_css_class(grp_lbl, "caption");
+            gtk_widget_add_css_class(grp_lbl, "dim-label");
+            gtk_box_append(GTK_BOX(row_box), grp_lbl);
+        }
 
-        constexpr size_t MAX_FILTERED_CHANNELS = 5000;
-        for (const auto& ch : all_channels) {
-            if (!selected_grp.empty() && ch.group != selected_grp) {
-                continue;
-            }
-            if (!query.empty()) {
-                if (!contains_ci_lower_needle(ch.name, query) &&
-                    !contains_ci_lower_needle(ch.group, query) &&
-                    !contains_ci_lower_needle(ch.id, query)) {
-                    continue;
-                }
-            }
-            filtered_channels.push_back(ch);
-            if (filtered_channels.size() >= MAX_FILTERED_CHANNELS) {
-                break;
-            }
+        gtk_list_box_append(channel_list_box, row_box);
+    }
+
+    // Loads the next batch of channels from the .m3u file on disk into memory and appends them to the scroller
+    void load_more_channels_into_scroller(size_t batch_size) {
+        size_t already_loaded = loaded_scroller_channels.size();
+        if (already_loaded >= matching_slot_indices.size()) {
+            return;
+        }
+
+        auto batch = M3uParser::load_channels_range(
+            playlist_index, matching_slot_indices, already_loaded, batch_size);
+        if (batch.empty()) {
+            return;
         }
 
         bool has_epg = epg_manager->total_programmes() > 0;
-        constexpr size_t MAX_VISIBLE_ROWS = 300;
-        size_t count = 0;
-
-        for (const auto& ch : filtered_channels) {
-            if (count >= MAX_VISIBLE_ROWS) {
-                break;
-            }
-            ++count;
-
-            GtkWidget* row_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
-            gtk_widget_set_margin_start(row_box, 8);
-            gtk_widget_set_margin_end(row_box, 8);
-            gtk_widget_set_margin_top(row_box, 6);
-            gtk_widget_set_margin_bottom(row_box, 6);
-
-            std::string title = std::to_string(ch.number) + ". " + ch.name;
-            GtkWidget* name_lbl = gtk_label_new(title.c_str());
-            gtk_widget_set_halign(name_lbl, GTK_ALIGN_START);
-            gtk_label_set_ellipsize(GTK_LABEL(name_lbl), PANGO_ELLIPSIZE_END);
-            gtk_widget_add_css_class(name_lbl, "heading");
-            gtk_box_append(GTK_BOX(row_box), name_lbl);
-
-            EpgProgramme now_p{};
-            EpgProgramme next_p{};
-            if (has_epg && epg_manager->get_now_and_next(ch, now_p, next_p)) {
-                std::string sub = "Now: " + now_p.title + " (" + now_p.formatted_time_range() + ")";
-                GtkWidget* epg_lbl = gtk_label_new(sub.c_str());
-                gtk_widget_set_halign(epg_lbl, GTK_ALIGN_START);
-                gtk_label_set_ellipsize(GTK_LABEL(epg_lbl), PANGO_ELLIPSIZE_END);
-                gtk_widget_add_css_class(epg_lbl, "caption");
-                gtk_widget_add_css_class(epg_lbl, "dim-label");
-                gtk_box_append(GTK_BOX(row_box), epg_lbl);
-            } else {
-                GtkWidget* grp_lbl = gtk_label_new(ch.group.c_str());
-                gtk_widget_set_halign(grp_lbl, GTK_ALIGN_START);
-                gtk_widget_add_css_class(grp_lbl, "caption");
-                gtk_widget_add_css_class(grp_lbl, "dim-label");
-                gtk_box_append(GTK_BOX(row_box), grp_lbl);
-            }
-
-            gtk_list_box_append(channel_list_box, row_box);
+        loaded_scroller_channels.reserve(already_loaded + batch.size());
+        for (auto& ch : batch) {
+            append_channel_row_widget(ch, has_epg);
+            loaded_scroller_channels.push_back(std::move(ch));
         }
+    }
+
+    void rebuild_channel_list() {
+        clear_list_box(channel_list_box);
+        loaded_scroller_channels.clear();
+        loaded_scroller_channels.shrink_to_fit();
+
+        if (channel_scrolled_window) {
+            if (GtkAdjustment* vadj = gtk_scrolled_window_get_vadjustment(channel_scrolled_window)) {
+                gtk_adjustment_set_value(vadj, 0.0);
+            }
+        }
+
+        const char* q_raw = gtk_editable_get_text(GTK_EDITABLE(channel_search_entry));
+        std::string query = q_raw ? q_raw : "";
+
+        guint grp_idx = gtk_drop_down_get_selected(group_dropdown);
+        uint16_t grp_filter = (grp_idx > 0 && grp_idx < group_names.size())
+                                  ? static_cast<uint16_t>(grp_idx)
+                                  : 0;
+
+        matching_slot_indices = M3uParser::filter_slots(playlist_index, grp_filter, query);
+        // Only materialize the initial scroller window of channels into memory; subsequent
+        // batches are loaded on demand as the user scrolls near the bottom of the scroller.
+        load_more_channels_into_scroller(SCROLLER_BATCH_SIZE);
     }
 
     void select_and_play_channel(const Channel& ch) {
@@ -1567,26 +1559,13 @@ struct MainWindow::Impl {
     }
 
     bool find_m3u_channel_for_epg(const EpgProgramme& prog, Channel& out_ch) const {
-        if (!prog.channel_name.empty()) {
-            auto it = channel_by_name_idx.find(prog.channel_name);
-            if (it != channel_by_name_idx.end() && it->second < all_channels.size()) {
-                out_ch = all_channels[it->second];
-                return true;
-            }
-        }
-        if (!prog.channel_id.empty()) {
-            auto it = channel_by_id_idx.find(to_lower_copy(prog.channel_id));
-            if (it != channel_by_id_idx.end() && it->second < all_channels.size()) {
-                out_ch = all_channels[it->second];
-                return true;
-            }
-        }
-        return false;
+        return M3uParser::find_channel_by_id_or_name(
+            playlist_index, prog.channel_id, prog.channel_name, out_ch);
     }
 
     void rebuild_global_epg_search() {
         clear_list_box(global_epg_list_box);
-        if (all_channels.empty()) {
+        if (playlist_index.slots.empty()) {
             AdwActionRow* empty_row = ADW_ACTION_ROW(adw_action_row_new());
             adw_preferences_row_set_title(
                 ADW_PREFERENCES_ROW(empty_row),
@@ -1616,52 +1595,55 @@ struct MainWindow::Impl {
             adw_action_row_set_subtitle(row, ms);
             g_free(ms);
 
-            Channel matched_ch{};
-            if (find_m3u_channel_for_epg(prog, matched_ch)) {
-                GtkWidget* play_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
-                gtk_widget_set_valign(play_btn, GTK_ALIGN_CENTER);
-                gtk_widget_set_tooltip_text(play_btn, "Watch this M3U Channel Live");
+            // Resolve the full Channel from disk only when the user clicks Play or Schedule
+            GtkWidget* play_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
+            gtk_widget_set_valign(play_btn, GTK_ALIGN_CENTER);
+            gtk_widget_set_tooltip_text(play_btn, "Watch this M3U Channel Live");
 
-                struct PlayCtx {
-                    Impl* self;
-                    Channel ch;
-                };
-                auto* pctx = new PlayCtx{this, matched_ch};
-                g_signal_connect_data(
-                    play_btn, "clicked",
-                    G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-                        auto* c = static_cast<PlayCtx*>(user_data);
-                        c->self->select_and_play_channel(c->ch);
+            struct PlayCtx {
+                Impl* self;
+                EpgProgramme prog;
+            };
+            auto* pctx = new PlayCtx{this, prog};
+            g_signal_connect_data(
+                play_btn, "clicked",
+                G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+                    auto* c = static_cast<PlayCtx*>(user_data);
+                    Channel matched_ch{};
+                    if (c->self->find_m3u_channel_for_epg(c->prog, matched_ch)) {
+                        c->self->select_and_play_channel(matched_ch);
                         adw_view_stack_set_visible_child_name(c->self->view_stack, "player");
-                    }),
-                    pctx,
-                    +[](gpointer data, GClosure*) { delete static_cast<PlayCtx*>(data); },
-                    static_cast<GConnectFlags>(0));
-                adw_action_row_add_suffix(row, play_btn);
+                    }
+                }),
+                pctx,
+                +[](gpointer data, GClosure*) { delete static_cast<PlayCtx*>(data); },
+                static_cast<GConnectFlags>(0));
+            adw_action_row_add_suffix(row, play_btn);
 
-                GtkWidget* sched_btn = gtk_button_new_from_icon_name("media-record-symbolic");
-                gtk_widget_set_valign(sched_btn, GTK_ALIGN_CENTER);
-                gtk_widget_set_tooltip_text(sched_btn, "Schedule FFmpeg Recording for this Programme");
+            GtkWidget* sched_btn = gtk_button_new_from_icon_name("media-record-symbolic");
+            gtk_widget_set_valign(sched_btn, GTK_ALIGN_CENTER);
+            gtk_widget_set_tooltip_text(sched_btn, "Schedule FFmpeg Recording for this Programme");
 
-                struct GlobalSchedCtx {
-                    Impl* self;
-                    Channel ch;
-                    EpgProgramme prog;
-                };
-                auto* sctx = new GlobalSchedCtx{this, matched_ch, prog};
-                g_signal_connect_data(
-                    sched_btn, "clicked",
-                    G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-                        auto* c = static_cast<GlobalSchedCtx*>(user_data);
-                        c->self->recorder.schedule_recording(c->ch, c->prog);
-                        c->self->show_toast("Scheduled recording: " + c->prog.title + " (" + c->ch.name + ")");
+            struct GlobalSchedCtx {
+                Impl* self;
+                EpgProgramme prog;
+            };
+            auto* sctx = new GlobalSchedCtx{this, prog};
+            g_signal_connect_data(
+                sched_btn, "clicked",
+                G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+                    auto* c = static_cast<GlobalSchedCtx*>(user_data);
+                    Channel matched_ch{};
+                    if (c->self->find_m3u_channel_for_epg(c->prog, matched_ch)) {
+                        c->self->recorder.schedule_recording(matched_ch, c->prog);
+                        c->self->show_toast("Scheduled recording: " + c->prog.title + " (" + matched_ch.name + ")");
                         c->self->rebuild_scheduled_recordings_list();
-                    }),
-                    sctx,
-                    +[](gpointer data, GClosure*) { delete static_cast<GlobalSchedCtx*>(data); },
-                    static_cast<GConnectFlags>(0));
-                adw_action_row_add_suffix(row, sched_btn);
-            }
+                    }
+                }),
+                sctx,
+                +[](gpointer data, GClosure*) { delete static_cast<GlobalSchedCtx*>(data); },
+                static_cast<GConnectFlags>(0));
+            adw_action_row_add_suffix(row, sched_btn);
 
             gtk_list_box_append(global_epg_list_box, GTK_WIDGET(row));
         }

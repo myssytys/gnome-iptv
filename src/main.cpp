@@ -73,12 +73,27 @@ int run_self_test() {
         local_loaded = r.success;
         local_count = r.channels.size();
     });
-    g_unlink(local_m3u_path.c_str());
     if (!local_loaded || local_count != 2) {
+        g_unlink(local_m3u_path.c_str());
         std::cerr << "[FAIL] Local .m3u file loading failed!\n";
         return 1;
     }
     std::cout << "  -> Loaded " << local_count << " channels from local file " << local_m3u_path << "\n";
+
+    std::cout << "[Self-Test] 2c. Testing On-Demand M3U File-Offset Indexer & Scroller Batch Loading...\n";
+    auto idx = iptv::M3uParser::index_file(local_m3u_path, local_m3u_path);
+    auto slots = iptv::M3uParser::filter_slots(idx, 0, "");
+    auto page1 = iptv::M3uParser::load_channels_range(idx, slots, 0, 1);
+    auto page2 = iptv::M3uParser::load_channels_range(idx, slots, 1, 1);
+    g_unlink(local_m3u_path.c_str());
+    if (!idx.success || slots.size() != 2 || page1.size() != 1 || page2.size() != 1 ||
+        page1[0].name != "YLE TV1 HD" || page2[0].name != "YLE TV2 HD") {
+        std::cerr << "[FAIL] On-demand M3U indexer / range loader failed!\n";
+        return 1;
+    }
+    std::cout << "  -> Indexed " << idx.slots.size()
+              << " slots (16 bytes/slot) and loaded batches on demand ('"
+              << page1[0].name << "', '" << page2[0].name << "')\n";
 
     std::cout << "[Self-Test] 3. Testing XMLTV EPG Parser & SQLite Store...\n";
     std::time_t now = std::time(nullptr);
