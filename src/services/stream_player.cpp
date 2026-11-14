@@ -643,6 +643,18 @@ double StreamPlayer::volume() const {
     return impl_->user_volume.load();
 }
 
+void StreamPlayer::set_fullscreen_active(bool fullscreen) {
+    if (impl_->offload) {
+        // In Wayland/Mutter, hardware direct scanout (graphics offload) on a fullscreen
+        // surface can cause Wayland compositor shell panels (like window-list or top panel)
+        // to lose tracking or become occluded. We dynamically disable offload during fullscreen
+        // and re-enable it when exiting fullscreen.
+        gtk_graphics_offload_set_enabled(
+            GTK_GRAPHICS_OFFLOAD(impl_->offload),
+            fullscreen ? GTK_GRAPHICS_OFFLOAD_DISABLED : GTK_GRAPHICS_OFFLOAD_ENABLED);
+    }
+}
+
 PlayerStatus StreamPlayer::current_status() const {
     std::lock_guard<std::mutex> lock(impl_->mtx);
     return impl_->snapshot_locked();

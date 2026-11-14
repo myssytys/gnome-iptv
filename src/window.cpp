@@ -211,9 +211,18 @@ struct MainWindow::Impl {
     }
 
     void set_fullscreen(bool full) {
-        is_fullscreen = full;
         if (full) {
             gtk_window_fullscreen(GTK_WINDOW(window));
+        } else {
+            gtk_window_unfullscreen(GTK_WINDOW(window));
+        }
+    }
+
+    void on_fullscreen_state_changed(bool full) {
+        is_fullscreen = full;
+        player.set_fullscreen_active(full);
+
+        if (full) {
             adw_navigation_split_view_set_collapsed(split_view, TRUE);
             adw_navigation_split_view_set_show_content(split_view, TRUE);
             if (content_header) {
@@ -227,7 +236,6 @@ struct MainWindow::Impl {
                 gtk_widget_set_tooltip_text(GTK_WIDGET(fullscreen_btn), "Exit Fullscreen (F11 / Esc / Double-Click)");
             }
         } else {
-            gtk_window_unfullscreen(GTK_WINDOW(window));
             adw_navigation_split_view_set_collapsed(split_view, FALSE);
             if (content_header) {
                 gtk_widget_set_visible(GTK_WIDGET(content_header), TRUE);
@@ -1162,6 +1170,16 @@ struct MainWindow::Impl {
             })),
             this);
         gtk_widget_add_controller(GTK_WIDGET(window), key_ctrl);
+
+        // Listen for window fullscreen/unfullscreen state transitions from the Wayland compositor
+        g_signal_connect(
+            window, "notify::fullscreened",
+            G_CALLBACK(+[](GObject* obj, GParamSpec*, gpointer data) {
+                auto* self = static_cast<Impl*>(data);
+                gboolean full = gtk_window_is_fullscreen(GTK_WINDOW(obj));
+                self->on_fullscreen_state_changed(full != FALSE);
+            }),
+            this);
     }
 
     void wire_callbacks() {

@@ -48,6 +48,7 @@ public:
     bool is_muted() const;
     void set_volume(double volume);
     double volume() const;
+    void set_fullscreen_active(bool fullscreen);
 
     PlayerStatus current_status() const;
 
