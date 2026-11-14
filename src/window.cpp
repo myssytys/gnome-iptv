@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 namespace iptv {
@@ -81,6 +82,8 @@ struct MainWindow::Impl {
     std::vector<Channel> all_channels;
     std::vector<Channel> filtered_channels;
     std::vector<std::string> group_names;
+    std::unordered_map<std::string, size_t> channel_by_name_idx;
+    std::unordered_map<std::string, size_t> channel_by_id_idx;
     Channel selected_channel;
     bool has_selected_channel = false;
 
@@ -145,6 +148,7 @@ struct MainWindow::Impl {
         config_store.save(config);
 
         epg_manager = new EpgManager(config_store.db_path());
+        epg_manager->set_active_channels(all_channels);
         player.configure(config);
         recorder.configure(config);
 
@@ -587,6 +591,7 @@ struct MainWindow::Impl {
                 auto* self = static_cast<Impl*>(data);
                 if (!self->suppress_group_signal) {
                     self->rebuild_channel_list();
+                    self->rebuild_global_epg_search();
                 }
             }),
             this);
@@ -1106,7 +1111,25 @@ struct MainWindow::Impl {
             }
 
             all_channels = std::move(res.channels);
+            channel_by_name_idx.clear();
+            channel_by_id_idx.clear();
+            for (size_t i = 0; i < all_channels.size(); ++i) {
+                const auto& ch = all_channels[i];
+                if (!ch.name.empty()) {
+                    channel_by_name_idx.try_emplace(ch.name, i);
+                }
+                if (!ch.id.empty() && ch.id != ch.name) {
+                    channel_by_id_idx.try_emplace(to_lower_copy(ch.id), i);
+                }
+            }
+            epg_manager->set_active_channels(all_channels);
             show_toast("Connected: Loaded " + std::to_string(all_channels.size()) + " channel(s).");
+
+            if (epg_manager->total_programmes() > 0) {
+                std::string footer = "EPG: " + std::to_string(epg_manager->total_programmes()) +
+                                     " programmes (M3U channels)";
+                gtk_label_set_text(epg_footer_label, footer.c_str());
+            }
 
             // If M3U header or Xtream Codes URL provided an EPG URL and user has no EPG URL set, adopt it
             if (!res.discovered_epg_url.empty() && config.epg_url.empty()) {
@@ -1115,6 +1138,7 @@ struct MainWindow::Impl {
 
             rebuild_groups_dropdown();
             rebuild_channel_list();
+            rebuild_global_epg_search();
 
             // Auto-select and play the first channel if only 1 channel or none selected yet
             if (!all_channels.empty() && !has_selected_channel) {
@@ -1346,15 +1370,48 @@ struct MainWindow::Impl {
         }
     }
 
+    bool find_m3u_channel_for_epg(const EpgProgramme& prog, Channel& out_ch) const {
+        if (!prog.channel_name.empty()) {
+            auto it = channel_by_name_idx.find(prog.channel_name);
+            if (it != channel_by_name_idx.end() && it->second < all_channels.size()) {
+                out_ch = all_channels[it->second];
+                return true;
+            }
+        }
+        if (!prog.channel_id.empty()) {
+            auto it = channel_by_id_idx.find(to_lower_copy(prog.channel_id));
+            if (it != channel_by_id_idx.end() && it->second < all_channels.size()) {
+                out_ch = all_channels[it->second];
+                return true;
+            }
+        }
+        return false;
+    }
+
     void rebuild_global_epg_search() {
         clear_list_box(global_epg_list_box);
+        if (all_channels.empty()) {
+            AdwActionRow* empty_row = ADW_ACTION_ROW(adw_action_row_new());
+            adw_preferences_row_set_title(
+                ADW_PREFERENCES_ROW(empty_row),
+                "Load an .m3u playlist first to view EPG programmes for your M3U channels.");
+            gtk_list_box_append(global_epg_list_box, GTK_WIDGET(empty_row));
+            return;
+        }
+
         const char* q = gtk_editable_get_text(GTK_EDITABLE(global_epg_search_entry));
         std::string query = q ? q : "";
 
-        auto results = epg_manager->search_programmes(query, 100);
+        guint grp_idx = gtk_drop_down_get_selected(group_dropdown);
+        std::string selected_grp = (grp_idx > 0 && grp_idx < group_names.size())
+                                       ? group_names[grp_idx]
+                                       : "";
+
+        auto results = epg_manager->search_programmes(query, 150, selected_grp);
         for (const auto& prog : results) {
             AdwActionRow* row = ADW_ACTION_ROW(adw_action_row_new());
-            std::string t = "[" + prog.channel_id + "] " + prog.formatted_time_range() + " — " + prog.title;
+            std::string ch_display = prog.channel_name.empty() ? prog.channel_id : prog.channel_name;
+            std::string t = "[" + ch_display + "]  " + prog.formatted_time_range() + "  —  " + prog.title;
             char* mt = g_markup_escape_text(t.c_str(), -1);
             adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), mt);
             g_free(mt);
@@ -1362,6 +1419,53 @@ struct MainWindow::Impl {
             char* ms = g_markup_escape_text(prog.description.c_str(), -1);
             adw_action_row_set_subtitle(row, ms);
             g_free(ms);
+
+            Channel matched_ch{};
+            if (find_m3u_channel_for_epg(prog, matched_ch)) {
+                GtkWidget* play_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
+                gtk_widget_set_valign(play_btn, GTK_ALIGN_CENTER);
+                gtk_widget_set_tooltip_text(play_btn, "Watch this M3U Channel Live");
+
+                struct PlayCtx {
+                    Impl* self;
+                    Channel ch;
+                };
+                auto* pctx = new PlayCtx{this, matched_ch};
+                g_signal_connect_data(
+                    play_btn, "clicked",
+                    G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+                        auto* c = static_cast<PlayCtx*>(user_data);
+                        c->self->select_and_play_channel(c->ch);
+                        adw_view_stack_set_visible_child_name(c->self->view_stack, "player");
+                    }),
+                    pctx,
+                    +[](gpointer data, GClosure*) { delete static_cast<PlayCtx*>(data); },
+                    static_cast<GConnectFlags>(0));
+                adw_action_row_add_suffix(row, play_btn);
+
+                GtkWidget* sched_btn = gtk_button_new_from_icon_name("media-record-symbolic");
+                gtk_widget_set_valign(sched_btn, GTK_ALIGN_CENTER);
+                gtk_widget_set_tooltip_text(sched_btn, "Schedule FFmpeg Recording for this Programme");
+
+                struct GlobalSchedCtx {
+                    Impl* self;
+                    Channel ch;
+                    EpgProgramme prog;
+                };
+                auto* sctx = new GlobalSchedCtx{this, matched_ch, prog};
+                g_signal_connect_data(
+                    sched_btn, "clicked",
+                    G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+                        auto* c = static_cast<GlobalSchedCtx*>(user_data);
+                        c->self->recorder.schedule_recording(c->ch, c->prog);
+                        c->self->show_toast("Scheduled recording: " + c->prog.title + " (" + c->ch.name + ")");
+                        c->self->rebuild_scheduled_recordings_list();
+                    }),
+                    sctx,
+                    +[](gpointer data, GClosure*) { delete static_cast<GlobalSchedCtx*>(data); },
+                    static_cast<GConnectFlags>(0));
+                adw_action_row_add_suffix(row, sched_btn);
+            }
 
             gtk_list_box_append(global_epg_list_box, GTK_WIDGET(row));
         }

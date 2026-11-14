@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace iptv {
 
@@ -110,6 +111,9 @@ struct EpgManager::Impl {
 
     // Map lowercase display-name -> xmltv channel id
     std::unordered_map<std::string, std::string> display_name_to_id;
+    std::unordered_set<std::string> known_epg_channel_ids;
+    std::vector<Channel> m3u_channels;
+    bool has_m3u_filter = false;
 
     UpdateCallback on_updated;
     bool fetching = false;
@@ -165,20 +169,41 @@ struct EpgManager::Impl {
                 ON epg_programmes(channel_id, start_time, stop_time);
             CREATE INDEX IF NOT EXISTS idx_epg_prog_channel_nocase
                 ON epg_programmes(channel_id COLLATE NOCASE, stop_time, start_time);
+            CREATE TABLE IF NOT EXISTS m3u_active_channels (
+                channel_id TEXT PRIMARY KEY,
+                channel_name TEXT,
+                group_title TEXT,
+                channel_number INTEGER
+            );
+            DELETE FROM m3u_active_channels;
         )SQL";
         char* err_msg = nullptr;
         sqlite3_exec(db, schema, nullptr, nullptr, &err_msg);
         if (err_msg) sqlite3_free(err_msg);
 
-        // Load existing channel alias map and count
+        // Load existing channel alias map and known EPG channel IDs
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db, "SELECT id, display_name FROM epg_channels;", -1, &stmt, nullptr) == SQLITE_OK) {
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 const char* cid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
                 const char* dname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-                if (cid && dname) {
-                    display_name_to_id[to_lower(dname)] = cid;
-                    display_name_to_id[to_lower(cid)] = cid;
+                if (cid) {
+                    std::string lcid = to_lower(cid);
+                    known_epg_channel_ids.insert(lcid);
+                    display_name_to_id[lcid] = cid;
+                    if (dname) {
+                        display_name_to_id[to_lower(dname)] = cid;
+                    }
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        if (sqlite3_prepare_v2(db, "SELECT DISTINCT channel_id FROM epg_programmes;", -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char* cid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (cid && *cid) {
+                    known_epg_channel_ids.insert(to_lower(cid));
                 }
             }
             sqlite3_finalize(stmt);
@@ -206,6 +231,57 @@ struct EpgManager::Impl {
             return lname;
         }
         return {};
+    }
+
+    void sync_active_channels_locked() {
+        if (!db) return;
+        sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db, "DELETE FROM m3u_active_channels;", nullptr, nullptr, nullptr);
+
+        if (!m3u_channels.empty()) {
+            sqlite3_stmt* ins_stmt = nullptr;
+            sqlite3_prepare_v2(
+                db,
+                "INSERT OR IGNORE INTO m3u_active_channels (channel_id, channel_name, group_title, channel_number) "
+                "VALUES (?1, ?2, ?3, ?4);",
+                -1, &ins_stmt, nullptr);
+            if (ins_stmt) {
+                std::unordered_set<std::string> seen;
+                for (const auto& ch : m3u_channels) {
+                    std::string cid = resolve_channel_id_locked(ch);
+                    if (cid.empty()) continue;
+                    // If EPG channel set is already populated, only index M3U channels that have EPG data
+                    if (!known_epg_channel_ids.empty() && !known_epg_channel_ids.contains(cid)) {
+                        continue;
+                    }
+                    if (!seen.insert(cid).second) {
+                        continue;
+                    }
+                    sqlite3_bind_text(ins_stmt, 1, cid.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(ins_stmt, 2, ch.name.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(ins_stmt, 3, ch.group.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(ins_stmt, 4, ch.number);
+                    sqlite3_step(ins_stmt);
+                    sqlite3_reset(ins_stmt);
+                }
+                sqlite3_finalize(ins_stmt);
+            }
+        }
+        sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+
+        if (has_m3u_filter) {
+            total_programmes_count = 0;
+            sqlite3_stmt* cnt_stmt = nullptr;
+            const char* cnt_sql =
+                "SELECT COUNT(*) FROM epg_programmes p "
+                "INNER JOIN m3u_active_channels m ON p.channel_id = m.channel_id;";
+            if (sqlite3_prepare_v2(db, cnt_sql, -1, &cnt_stmt, nullptr) == SQLITE_OK) {
+                if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
+                    total_programmes_count = sqlite3_column_int(cnt_stmt, 0);
+                }
+                sqlite3_finalize(cnt_stmt);
+            }
+        }
     }
 };
 
@@ -380,7 +456,9 @@ EpgUpdateStatus EpgManager::load_from_memory(const std::string& raw_bytes) {
                 -1, &ch_stmt, nullptr);
             for (const auto& [cid, dname] : parsed_channels) {
                 if (cid.empty()) continue;
-                impl_->display_name_to_id[to_lower(cid)] = cid;
+                std::string lcid = to_lower(cid);
+                impl_->known_epg_channel_ids.insert(lcid);
+                impl_->display_name_to_id[lcid] = cid;
                 if (!dname.empty()) {
                     impl_->display_name_to_id[to_lower(dname)] = cid;
                 }
@@ -407,6 +485,7 @@ EpgUpdateStatus EpgManager::load_from_memory(const std::string& raw_bytes) {
             if (prog_stmt) {
                 for (const auto& p : parsed_programmes) {
                     std::string norm_cid = to_lower(p.channel_id);
+                    impl_->known_epg_channel_ids.insert(norm_cid);
                     if (del_overlap_stmt) {
                         sqlite3_bind_text(del_overlap_stmt, 1, norm_cid.c_str(), -1, SQLITE_TRANSIENT);
                         sqlite3_bind_int64(del_overlap_stmt, 2, static_cast<sqlite3_int64>(p.start_time));
@@ -430,12 +509,16 @@ EpgUpdateStatus EpgManager::load_from_memory(const std::string& raw_bytes) {
 
             sqlite3_exec(impl_->db, "COMMIT;", nullptr, nullptr, nullptr);
 
-            sqlite3_stmt* cnt_stmt = nullptr;
-            if (sqlite3_prepare_v2(impl_->db, "SELECT COUNT(*) FROM epg_programmes;", -1, &cnt_stmt, nullptr) == SQLITE_OK) {
-                if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
-                    impl_->total_programmes_count = sqlite3_column_int(cnt_stmt, 0);
+            if (impl_->has_m3u_filter) {
+                impl_->sync_active_channels_locked();
+            } else {
+                sqlite3_stmt* cnt_stmt = nullptr;
+                if (sqlite3_prepare_v2(impl_->db, "SELECT COUNT(*) FROM epg_programmes;", -1, &cnt_stmt, nullptr) == SQLITE_OK) {
+                    if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
+                        impl_->total_programmes_count = sqlite3_column_int(cnt_stmt, 0);
+                    }
+                    sqlite3_finalize(cnt_stmt);
                 }
-                sqlite3_finalize(cnt_stmt);
             }
         }
         impl_->last_updated_ts = std::time(nullptr);
@@ -448,6 +531,13 @@ EpgUpdateStatus EpgManager::load_from_memory(const std::string& raw_bytes) {
     status.message = "Loaded " + std::to_string(status.programmes_parsed) + " EPG programmes across " +
                      std::to_string(status.channels_parsed) + " channel definitions.";
     return status;
+}
+
+void EpgManager::set_active_channels(const std::vector<Channel>& channels) {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    impl_->m3u_channels = channels;
+    impl_->has_m3u_filter = true;
+    impl_->sync_active_channels_locked();
 }
 
 struct EpgAsyncNotify {
@@ -709,19 +799,35 @@ std::vector<EpgProgramme> EpgManager::get_channel_schedule(const Channel& ch, st
     return list;
 }
 
-std::vector<EpgProgramme> EpgManager::search_programmes(const std::string& query, int limit) const {
+std::vector<EpgProgramme> EpgManager::search_programmes(const std::string& query,
+                                                        int limit,
+                                                        const std::string& group_filter) const {
     std::vector<EpgProgramme> list;
     std::lock_guard<std::mutex> lock(impl_->mtx);
     if (!impl_->db) return list;
+
+    // Only return EPG programmes belonging to channels in the active .m3u playlist
+    if (impl_->has_m3u_filter && impl_->m3u_channels.empty()) {
+        return list;
+    }
 
     std::time_t now = std::time(nullptr);
     std::string pattern = "%" + query + "%";
 
     const char* sql =
-        "SELECT channel_id, start_time, stop_time, title, subtitle, description, category "
-        "FROM epg_programmes "
-        "WHERE stop_time > ?1 AND (title LIKE ?2 OR description LIKE ?2 OR category LIKE ?2 OR channel_id LIKE ?2) "
-        "ORDER BY start_time ASC LIMIT ?3;";
+        "SELECT p.channel_id, p.start_time, p.stop_time, p.title, p.subtitle, p.description, p.category, "
+        "       m.channel_name "
+        "FROM epg_programmes p "
+        "INNER JOIN m3u_active_channels m ON p.channel_id = m.channel_id "
+        "WHERE p.stop_time > ?1 "
+        "  AND (?2 = '%%' OR p.title LIKE ?2 OR p.description LIKE ?2 OR p.category LIKE ?2 "
+        "       OR p.channel_id LIKE ?2 OR m.channel_name LIKE ?2) "
+        "  AND (?3 = '' OR m.group_title = ?3) "
+        "ORDER BY "
+        "  CASE WHEN p.start_time <= ?1 AND p.stop_time > ?1 THEN 0 ELSE 1 END ASC, "
+        "  m.channel_number ASC, "
+        "  p.start_time ASC "
+        "LIMIT ?4;";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -729,7 +835,8 @@ std::vector<EpgProgramme> EpgManager::search_programmes(const std::string& query
     }
     sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(now));
     sqlite3_bind_text(stmt, 2, pattern.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, limit);
+    sqlite3_bind_text(stmt, 3, group_filter.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         EpgProgramme p;
@@ -741,10 +848,12 @@ std::vector<EpgProgramme> EpgManager::search_programmes(const std::string& query
         const char* c4 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
         const char* c5 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
         const char* c6 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-        p.title       = c3 ? c3 : "";
-        p.subtitle    = c4 ? c4 : "";
-        p.description = c5 ? c5 : "";
-        p.category    = c6 ? c6 : "";
+        const char* c7 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+        p.title        = c3 ? c3 : "";
+        p.subtitle     = c4 ? c4 : "";
+        p.description  = c5 ? c5 : "";
+        p.category     = c6 ? c6 : "";
+        p.channel_name = (c7 && *c7) ? c7 : p.channel_id;
         list.push_back(std::move(p));
     }
     sqlite3_finalize(stmt);

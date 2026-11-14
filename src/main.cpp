@@ -100,6 +100,7 @@ int run_self_test() {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<tv>\n"
         "  <channel id=\"yle1.fi\"><display-name>YLE TV1 HD</display-name></channel>\n"
+        "  <channel id=\"unlisted.tv\"><display-name>Unlisted Foreign TV</display-name></channel>\n"
         "  <programme start=\"" + fmt_xmltv(tm_start) + "\" stop=\"" + fmt_xmltv(tm_mid) + "\" channel=\"yle1.fi\">\n"
         "    <title>Evening News</title>\n"
         "    <desc>Live national and international news broadcast.</desc>\n"
@@ -110,14 +111,27 @@ int run_self_test() {
         "    <desc>Exploring the archipelago.</desc>\n"
         "    <category>Documentary</category>\n"
         "  </programme>\n"
+        "  <programme start=\"" + fmt_xmltv(tm_start) + "\" stop=\"" + fmt_xmltv(tm_end) + "\" channel=\"unlisted.tv\">\n"
+        "    <title>Should Be Filtered Out</title>\n"
+        "    <desc>Not in the M3U playlist.</desc>\n"
+        "  </programme>\n"
         "</tv>\n";
 
     std::string tmp_db = "/tmp/gnome-iptv-selftest.db";
     g_unlink(tmp_db.c_str());
     iptv::EpgManager epg(tmp_db);
+    epg.set_active_channels(m3u_res.channels);
     auto epg_st = epg.load_from_memory(xmltv);
-    if (!epg_st.success || epg_st.programmes_parsed != 2) {
+    if (!epg_st.success || epg_st.programmes_parsed != 3) {
         std::cerr << "[FAIL] EPG load_from_memory failed: " << epg_st.message << "\n";
+        return 1;
+    }
+
+    auto m3u_epg_results = epg.search_programmes("", 100);
+    if (epg.total_programmes() != 2 || m3u_epg_results.size() != 2 ||
+        m3u_epg_results[0].channel_name != "YLE TV1 HD") {
+        std::cerr << "[FAIL] EPG M3U-only filtering failed (got " << m3u_epg_results.size()
+                  << " results, total=" << epg.total_programmes() << ")!\n";
         return 1;
     }
 
@@ -127,7 +141,8 @@ int run_self_test() {
         std::cerr << "[FAIL] EPG Now & Next lookup failed!\n";
         return 1;
     }
-    std::cout << "  -> EPG Now: '" << now_p.title << "', Next: '" << next_p.title << "'\n";
+    std::cout << "  -> EPG Now: '" << now_p.title << "', Next: '" << next_p.title
+              << "' (filtered out non-M3U channel, " << m3u_epg_results.size() << " active M3U EPG items)\n";
     g_unlink(tmp_db.c_str());
 
     std::cout << "[Self-Test] 4. Verifying FFmpeg Reconnect Command Generation...\n";

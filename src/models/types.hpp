@@ -16,7 +16,8 @@ struct Channel {
 };
 
 struct EpgProgramme {
-    std::string channel_id;  // XMLTV channel id
+    std::string channel_id;   // XMLTV channel id
+    std::string channel_name; // Matched .m3u channel display name
     std::string title;
     std::string subtitle;
     std::string description;

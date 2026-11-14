@@ -37,10 +37,15 @@ public:
     // Parse XMLTV content synchronously (also handles gzip magic bytes automatically)
     EpgUpdateStatus load_from_memory(const std::string& raw_bytes);
 
+    // Restrict EPG queries and counts strictly to channels present in the loaded .m3u playlist
+    void set_active_channels(const std::vector<Channel>& channels);
+
     // Query EPG data for a channel (matches tvg-id or channel display name)
     bool get_now_and_next(const Channel& ch, EpgProgramme& out_now, EpgProgramme& out_next) const;
     std::vector<EpgProgramme> get_channel_schedule(const Channel& ch, std::time_t from_time = 0, int limit = 200) const;
-    std::vector<EpgProgramme> search_programmes(const std::string& query, int limit = 200) const;
+    std::vector<EpgProgramme> search_programmes(const std::string& query,
+                                                int limit = 200,
+                                                const std::string& group_filter = "") const;
 
     std::time_t last_updated() const;
     std::time_t next_update_time() const;
