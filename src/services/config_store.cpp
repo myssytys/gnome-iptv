@@ -54,6 +54,14 @@ AppConfig ConfigStore::load() const {
             }
             if (e) g_error_free(e);
         };
+        auto get_double = [&](const char* group, const char* key, double& target) {
+            GError* e = nullptr;
+            double val = g_key_file_get_double(kf, group, key, &e);
+            if (!e) {
+                target = val;
+            }
+            if (e) g_error_free(e);
+        };
 
         get_str("Playlist", "m3u_url", cfg.m3u_url);
         get_str("EPG", "epg_url", cfg.epg_url);
@@ -65,6 +73,7 @@ AppConfig ConfigStore::load() const {
         get_int("Stream", "watchdog_timeout_seconds", cfg.watchdog_timeout_seconds);
         get_bool("Stream", "use_ffmpeg_player", cfg.use_ffmpeg_player);
         get_bool("Stream", "mute_audio", cfg.mute_audio);
+        get_double("Stream", "volume", cfg.volume);
     } else if (err) {
         g_error_free(err);
     }
@@ -73,6 +82,8 @@ AppConfig ConfigStore::load() const {
     if (cfg.epg_update_interval_minutes < 1) cfg.epg_update_interval_minutes = 15;
     if (cfg.reconnect_delay_seconds < 1) cfg.reconnect_delay_seconds = 2;
     if (cfg.watchdog_timeout_seconds < 3) cfg.watchdog_timeout_seconds = 10;
+    if (cfg.volume < 0.0) cfg.volume = 0.0;
+    if (cfg.volume > 1.0) cfg.volume = 1.0;
     if (cfg.recording_format != "mkv" && cfg.recording_format != "ts") {
         cfg.recording_format = "ts";
     }
@@ -92,6 +103,7 @@ bool ConfigStore::save(const AppConfig& cfg) const {
     g_key_file_set_integer(kf, "Stream", "watchdog_timeout_seconds", cfg.watchdog_timeout_seconds);
     g_key_file_set_boolean(kf, "Stream", "use_ffmpeg_player", cfg.use_ffmpeg_player ? TRUE : FALSE);
     g_key_file_set_boolean(kf, "Stream", "mute_audio", cfg.mute_audio ? TRUE : FALSE);
+    g_key_file_set_double(kf, "Stream", "volume", cfg.volume);
 
     g_mkdir_with_parents(cfg.recording_dir.c_str(), 0755);
 

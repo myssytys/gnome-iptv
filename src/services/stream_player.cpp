@@ -3,7 +3,9 @@
 #include <glib.h>
 #include <gio/gio.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -78,6 +80,8 @@ struct StreamPlayer::Impl {
     std::atomic<std::time_t> last_frame_time{0};
     std::atomic<int> session_gen{0};
     std::atomic<bool> muted{false};
+    std::atomic<double> user_volume{1.0};
+    std::atomic<double> current_gain{1.0};
 
     Channel current_channel;
     std::string status_message = "Select a channel or load an M3U playlist to begin.";
@@ -85,6 +89,7 @@ struct StreamPlayer::Impl {
     GSubprocess* video_proc = nullptr;
     guint watchdog_timer_id = 0;
     guint reconnect_timer_id = 0;
+    guint fade_timer_id = 0;
 
     Impl() {
         overlay = gtk_overlay_new();
@@ -186,11 +191,60 @@ struct StreamPlayer::Impl {
             g_source_remove(reconnect_timer_id);
             reconnect_timer_id = 0;
         }
+        if (fade_timer_id > 0) {
+            g_source_remove(fade_timer_id);
+            fade_timer_id = 0;
+        }
         stop_internal();
         if (overlay) {
             g_object_unref(overlay);
             overlay = nullptr;
         }
+    }
+
+    // Keep audio streaming ON (muted = FALSE) at all times so GStreamer's audio clock and
+    // pipeline never pause or reconfigure, while controlling output amplitude via stream volume (0.0..1.0).
+    void apply_stream_gain(double gain) {
+        double clamped = std::clamp(gain, 0.0, 1.0);
+        current_gain.store(clamped);
+        if (media_file) {
+            GtkMediaStream* ms = GTK_MEDIA_STREAM(media_file);
+            gtk_media_stream_set_muted(ms, FALSE);
+            gtk_media_stream_set_volume(ms, clamped);
+        }
+    }
+
+    void start_gain_fade(double target_gain) {
+        if (fade_timer_id > 0) {
+            g_source_remove(fade_timer_id);
+            fade_timer_id = 0;
+        }
+        double target = std::clamp(target_gain, 0.0, 1.0);
+        if (!media_file) {
+            current_gain.store(target);
+            return;
+        }
+        auto* target_ptr = new std::pair<Impl*, double>(this, target);
+        fade_timer_id = g_timeout_add_full(
+            G_PRIORITY_DEFAULT,
+            20,
+            [](gpointer data) -> gboolean {
+                auto* p = static_cast<std::pair<Impl*, double>*>(data);
+                Impl* self = p->first;
+                double tgt = p->second;
+                double cur = self->current_gain.load();
+                double diff = tgt - cur;
+                if (std::abs(diff) <= 0.06) {
+                    self->apply_stream_gain(tgt);
+                    self->fade_timer_id = 0;
+                    return G_SOURCE_REMOVE;
+                }
+                double step = (diff > 0.0) ? std::max(0.05, diff * 0.28) : std::min(-0.05, diff * 0.28);
+                self->apply_stream_gain(cur + step);
+                return G_SOURCE_CONTINUE;
+            },
+            target_ptr,
+            +[](gpointer data) { delete static_cast<std::pair<Impl*, double>*>(data); });
     }
 
     PlayerStatus snapshot_locked() const {
@@ -311,9 +365,11 @@ struct StreamPlayer::Impl {
         GInputStream* stdout_pipe = g_subprocess_get_stdout_pipe(sub);
 
         // Create empty GtkMediaFile first, realize on GdkSurface so GtkGstSink gets hardware
-        // OpenGL / DMABUF context, and THEN attach the input stream
+        // OpenGL / DMABUF context, and THEN attach the input stream.
+        // Audio streaming stays ON (muted = FALSE); gain is faded via stream volume (0.0..1.0).
         media_file = GTK_MEDIA_FILE(gtk_media_file_new());
-        gtk_media_stream_set_muted(GTK_MEDIA_STREAM(media_file), muted.load() ? TRUE : FALSE);
+        double initial_gain = muted.load() ? 0.0 : std::clamp(user_volume.load(), 0.0, 1.0);
+        apply_stream_gain(initial_gain);
         gtk_picture_set_paintable(GTK_PICTURE(picture), GDK_PAINTABLE(media_file));
 
         g_signal_connect(
@@ -322,7 +378,8 @@ struct StreamPlayer::Impl {
                 auto* self = static_cast<Impl*>(data);
                 GtkMediaStream* ms = GTK_MEDIA_STREAM(obj);
                 if (gtk_media_stream_is_prepared(ms) && !self->user_stopped.load()) {
-                    gtk_media_stream_set_muted(ms, self->muted.load() ? TRUE : FALSE);
+                    double gain = self->muted.load() ? 0.0 : std::clamp(self->user_volume.load(), 0.0, 1.0);
+                    self->apply_stream_gain(gain);
                     gtk_media_stream_play(ms);
                     self->last_frame_time.store(std::time(nullptr));
                     self->state.store(PlayerState::Playing);
@@ -515,9 +572,9 @@ void StreamPlayer::configure(const AppConfig& cfg) {
     std::lock_guard<std::mutex> lock(impl_->mtx);
     impl_->config = cfg;
     impl_->muted.store(cfg.mute_audio);
-    if (impl_->media_file) {
-        gtk_media_stream_set_muted(GTK_MEDIA_STREAM(impl_->media_file), cfg.mute_audio ? TRUE : FALSE);
-    }
+    impl_->user_volume.store(std::clamp(cfg.volume, 0.0, 1.0));
+    double target_gain = cfg.mute_audio ? 0.0 : std::clamp(cfg.volume, 0.0, 1.0);
+    impl_->apply_stream_gain(target_gain);
 }
 
 void StreamPlayer::set_status_callback(StatusCallback cb) {
@@ -561,13 +618,29 @@ void StreamPlayer::stop() {
 
 void StreamPlayer::set_muted(bool muted) {
     impl_->muted.store(muted);
-    if (impl_->media_file) {
-        gtk_media_stream_set_muted(GTK_MEDIA_STREAM(impl_->media_file), muted ? TRUE : FALSE);
-    }
+    double target_gain = muted ? 0.0 : std::clamp(impl_->user_volume.load(), 0.0, 1.0);
+    impl_->start_gain_fade(target_gain);
 }
 
 bool StreamPlayer::is_muted() const {
     return impl_->muted.load();
+}
+
+void StreamPlayer::set_volume(double volume) {
+    double clamped = std::clamp(volume, 0.0, 1.0);
+    impl_->user_volume.store(clamped);
+    if (impl_->fade_timer_id > 0) {
+        g_source_remove(impl_->fade_timer_id);
+        impl_->fade_timer_id = 0;
+    }
+    if (clamped > 0.0) {
+        impl_->muted.store(false);
+    }
+    impl_->apply_stream_gain(impl_->muted.load() ? 0.0 : clamped);
+}
+
+double StreamPlayer::volume() const {
+    return impl_->user_volume.load();
 }
 
 PlayerStatus StreamPlayer::current_status() const {

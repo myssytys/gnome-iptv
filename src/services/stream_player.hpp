@@ -46,6 +46,8 @@ public:
     void stop();
     void set_muted(bool muted);
     bool is_muted() const;
+    void set_volume(double volume);
+    double volume() const;
 
     PlayerStatus current_status() const;
 

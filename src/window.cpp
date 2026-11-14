@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -110,6 +111,11 @@ struct MainWindow::Impl {
     GtkButton* play_reconnect_btn = nullptr;
     GtkButton* stop_btn = nullptr;
     GtkToggleButton* mute_btn = nullptr;
+    GtkWidget* volume_knob_area = nullptr;
+    GtkScale* volume_scale = nullptr;
+    GtkLabel* volume_pct_label = nullptr;
+    double knob_drag_start_vol = 1.0;
+    bool suppress_volume_signal = false;
     GtkButton* record_btn = nullptr;
     GtkButton* fullscreen_btn = nullptr;
     GtkLabel* record_status_label = nullptr;
@@ -292,6 +298,48 @@ struct MainWindow::Impl {
             }
         }
         render_browsed_epg_card();
+    }
+
+    static const char* volume_icon_for_level(double effective_vol) {
+        if (effective_vol <= 0.005) return "audio-volume-muted-symbolic";
+        if (effective_vol < 0.34) return "audio-volume-low-symbolic";
+        if (effective_vol < 0.67) return "audio-volume-medium-symbolic";
+        return "audio-volume-high-symbolic";
+    }
+
+    double effective_volume() const {
+        return config.mute_audio ? 0.0 : std::clamp(config.volume, 0.0, 1.0);
+    }
+
+    void sync_volume_controls_ui() {
+        suppress_volume_signal = true;
+        double eff = effective_volume();
+        int pct = static_cast<int>(std::round(eff * 100.0));
+
+        if (mute_btn) {
+            gtk_toggle_button_set_active(mute_btn, (eff <= 0.005) ? TRUE : FALSE);
+            gtk_button_set_icon_name(GTK_BUTTON(mute_btn), volume_icon_for_level(eff));
+        }
+        if (volume_scale) {
+            gtk_range_set_value(GTK_RANGE(volume_scale), eff * 100.0);
+        }
+        if (volume_pct_label) {
+            std::string txt = std::to_string(pct) + "%";
+            gtk_label_set_text(volume_pct_label, txt.c_str());
+        }
+        if (volume_knob_area) {
+            gtk_widget_queue_draw(volume_knob_area);
+        }
+        suppress_volume_signal = false;
+    }
+
+    void set_audio_volume_from_knob(double vol) {
+        double clamped = std::clamp(vol, 0.0, 1.0);
+        config.volume = clamped;
+        config.mute_audio = (clamped <= 0.005);
+        config_store.save(config);
+        player.set_volume(clamped);
+        sync_volume_controls_ui();
     }
 
     void prompt_open_local_m3u() {
@@ -728,23 +776,153 @@ struct MainWindow::Impl {
             }),
             this);
 
+        // Audio Volume Knob & Smooth Stream Volume Fade Box
+        // Keeps the GStreamer audio stream active at all times while fading the stream gain (0%..100%).
+        GtkWidget* audio_vol_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_set_valign(audio_vol_box, GTK_ALIGN_CENTER);
+
         mute_btn = GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
-        gtk_button_set_icon_name(GTK_BUTTON(mute_btn),
-                                 config.mute_audio ? "audio-volume-muted-symbolic" : "audio-volume-high-symbolic");
-        gtk_toggle_button_set_active(mute_btn, config.mute_audio ? TRUE : FALSE);
-        gtk_widget_set_tooltip_text(GTK_WIDGET(mute_btn), "Mute / Unmute Audio");
+        gtk_button_set_icon_name(GTK_BUTTON(mute_btn), volume_icon_for_level(effective_volume()));
+        gtk_toggle_button_set_active(mute_btn, (effective_volume() <= 0.005) ? TRUE : FALSE);
+        gtk_widget_set_tooltip_text(
+            GTK_WIDGET(mute_btn),
+            "Fade Audio Stream Volume Out / In (Audio streaming stays ON)");
         g_signal_connect(
             mute_btn, "toggled",
             G_CALLBACK(+[](GtkToggleButton* btn, gpointer data) {
                 auto* self = static_cast<Impl*>(data);
+                if (self->suppress_volume_signal) return;
                 bool m = gtk_toggle_button_get_active(btn) != FALSE;
+                if (!m && self->config.volume <= 0.01) {
+                    self->config.volume = 0.75;
+                    self->player.set_volume(self->config.volume);
+                }
                 self->config.mute_audio = m;
                 self->config_store.save(self->config);
                 self->player.set_muted(m);
-                gtk_button_set_icon_name(GTK_BUTTON(btn),
-                                         m ? "audio-volume-muted-symbolic" : "audio-volume-high-symbolic");
+                self->sync_volume_controls_ui();
             }),
             this);
+
+        // Rotary Volume Knob (32x32 Cairo dial: drag up/down/left/right or scroll wheel)
+        volume_knob_area = gtk_drawing_area_new();
+        gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(volume_knob_area), 32);
+        gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(volume_knob_area), 32);
+        gtk_widget_set_tooltip_text(
+            volume_knob_area,
+            "Rotary Volume Knob — Drag or Scroll Wheel to Fade Audio Stream Volume (0%–100%)");
+        gtk_drawing_area_set_draw_func(
+            GTK_DRAWING_AREA(volume_knob_area),
+            +[](GtkDrawingArea*, cairo_t* cr, int width, int height, gpointer data) {
+                auto* self = static_cast<Impl*>(data);
+                double vol = self->effective_volume();
+                double cx = width * 0.5;
+                double cy = height * 0.5;
+                double radius = std::min(width, height) * 0.38;
+
+                constexpr double kPi = 3.14159265358979323846;
+                double start_angle = 0.75 * kPi; // 135 deg (bottom-left)
+                double sweep_angle = 1.50 * kPi; // 270 deg sweep to 405 deg (bottom-right)
+                double end_angle = start_angle + sweep_angle;
+                double val_angle = start_angle + vol * sweep_angle;
+
+                // Track background arc
+                cairo_set_line_width(cr, 3.2);
+                cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+                cairo_set_source_rgba(cr, 0.55, 0.58, 0.62, 0.35);
+                cairo_arc(cr, cx, cy, radius + 2.5, start_angle, end_angle);
+                cairo_stroke(cr);
+
+                // Active volume arc
+                if (vol > 0.005) {
+                    cairo_set_source_rgba(cr, 0.21, 0.52, 0.89, 0.95);
+                    cairo_arc(cr, cx, cy, radius + 2.5, start_angle, val_angle);
+                    cairo_stroke(cr);
+                }
+
+                // Knob body
+                cairo_arc(cr, cx, cy, radius - 1.0, 0.0, 2.0 * kPi);
+                cairo_set_source_rgba(cr, 0.22, 0.24, 0.27, 0.95);
+                cairo_fill_preserve(cr);
+                cairo_set_line_width(cr, 1.2);
+                cairo_set_source_rgba(cr, 0.75, 0.78, 0.82, 0.45);
+                cairo_stroke(cr);
+
+                // Knob pointer notch
+                double inner_r = (radius - 1.0) * 0.25;
+                double outer_r = (radius - 1.0) * 0.82;
+                cairo_set_line_width(cr, 2.0);
+                if (vol <= 0.005) {
+                    cairo_set_source_rgba(cr, 0.85, 0.32, 0.32, 0.95);
+                } else {
+                    cairo_set_source_rgba(cr, 0.95, 0.97, 1.0, 0.95);
+                }
+                cairo_move_to(cr, cx + std::cos(val_angle) * inner_r, cy + std::sin(val_angle) * inner_r);
+                cairo_line_to(cr, cx + std::cos(val_angle) * outer_r, cy + std::sin(val_angle) * outer_r);
+                cairo_stroke(cr);
+            },
+            this,
+            nullptr);
+
+        GtkGesture* knob_drag = gtk_gesture_drag_new();
+        g_signal_connect(
+            knob_drag, "drag-begin",
+            G_CALLBACK(+[](GtkGestureDrag*, double, double, gpointer data) {
+                auto* self = static_cast<Impl*>(data);
+                self->knob_drag_start_vol = self->effective_volume();
+            }),
+            this);
+        g_signal_connect(
+            knob_drag, "drag-update",
+            G_CALLBACK(+[](GtkGestureDrag*, double offset_x, double offset_y, gpointer data) {
+                auto* self = static_cast<Impl*>(data);
+                double delta = (-offset_y + offset_x * 0.5) / 110.0;
+                self->set_audio_volume_from_knob(self->knob_drag_start_vol + delta);
+            }),
+            this);
+        gtk_widget_add_controller(volume_knob_area, GTK_EVENT_CONTROLLER(knob_drag));
+
+        GtkEventController* knob_scroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
+        g_signal_connect(
+            knob_scroll, "scroll",
+            G_CALLBACK(+[](GtkEventControllerScroll*, double, double dy, gpointer data) -> gboolean {
+                auto* self = static_cast<Impl*>(data);
+                double step = (dy < 0.0) ? 0.05 : -0.05;
+                self->set_audio_volume_from_knob(self->effective_volume() + step);
+                return TRUE;
+            }),
+            this);
+        gtk_widget_add_controller(volume_knob_area, knob_scroll);
+
+        // Smooth Volume Slider (0%..100%) synced with the rotary knob
+        volume_scale = GTK_SCALE(gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 100.0, 1.0));
+        gtk_scale_set_draw_value(volume_scale, FALSE);
+        gtk_widget_set_size_request(GTK_WIDGET(volume_scale), 95, -1);
+        gtk_range_set_value(GTK_RANGE(volume_scale), effective_volume() * 100.0);
+        gtk_widget_set_tooltip_text(
+            GTK_WIDGET(volume_scale),
+            "Audio Stream Volume (0% = Faded Away while Audio Stream Stays On, 100% = Full)");
+        g_signal_connect(
+            volume_scale, "value-changed",
+            G_CALLBACK(+[](GtkRange* range, gpointer data) {
+                auto* self = static_cast<Impl*>(data);
+                if (self->suppress_volume_signal) return;
+                double pct = gtk_range_get_value(range);
+                self->set_audio_volume_from_knob(pct / 100.0);
+            }),
+            this);
+
+        int init_pct = static_cast<int>(std::round(effective_volume() * 100.0));
+        std::string init_pct_str = std::to_string(init_pct) + "%";
+        volume_pct_label = GTK_LABEL(gtk_label_new(init_pct_str.c_str()));
+        gtk_widget_add_css_class(GTK_WIDGET(volume_pct_label), "caption");
+        gtk_widget_add_css_class(GTK_WIDGET(volume_pct_label), "numeric");
+        gtk_widget_set_size_request(GTK_WIDGET(volume_pct_label), 38, -1);
+
+        gtk_box_append(GTK_BOX(audio_vol_box), GTK_WIDGET(mute_btn));
+        gtk_box_append(GTK_BOX(audio_vol_box), volume_knob_area);
+        gtk_box_append(GTK_BOX(audio_vol_box), GTK_WIDGET(volume_scale));
+        gtk_box_append(GTK_BOX(audio_vol_box), GTK_WIDGET(volume_pct_label));
 
         record_btn = GTK_BUTTON(gtk_button_new_with_label("Record Stream"));
         gtk_button_set_icon_name(record_btn, "media-record-symbolic");
@@ -790,7 +968,7 @@ struct MainWindow::Impl {
         gtk_box_append(GTK_BOX(controls_bar), GTK_WIDGET(play_reconnect_btn));
         gtk_box_append(GTK_BOX(controls_bar), GTK_WIDGET(stop_btn));
         gtk_box_append(GTK_BOX(controls_bar), GTK_WIDGET(next_channel_btn));
-        gtk_box_append(GTK_BOX(controls_bar), GTK_WIDGET(mute_btn));
+        gtk_box_append(GTK_BOX(controls_bar), audio_vol_box);
         gtk_box_append(GTK_BOX(controls_bar), GTK_WIDGET(record_btn));
         gtk_box_append(GTK_BOX(controls_bar), GTK_WIDGET(fullscreen_btn));
         gtk_box_append(GTK_BOX(top_player_box), controls_bar);
