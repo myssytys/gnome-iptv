@@ -17,12 +17,12 @@ ConfigStore::ConfigStore() {
 
 AppConfig ConfigStore::load() const {
     AppConfig cfg;
-    const char* videos_dir = g_get_user_special_dir(G_USER_DIRECTORY_VIDEOS);
-    if (videos_dir && *videos_dir) {
-        cfg.recording_dir = std::string(videos_dir) + "/IPTV";
+    const char* user_cache = g_get_user_cache_dir();
+    if (user_cache && *user_cache) {
+        cfg.recording_dir = std::string(user_cache) + "/gnome-iptv";
     } else {
         const char* home = g_get_home_dir();
-        cfg.recording_dir = std::string(home ? home : "/tmp") + "/Videos/IPTV";
+        cfg.recording_dir = std::string(home ? home : "/tmp") + "/.cache/gnome-iptv";
     }
     g_mkdir_with_parents(cfg.recording_dir.c_str(), 0755);
 
