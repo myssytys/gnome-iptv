@@ -13,13 +13,12 @@ BuildRequires:  ninja-build
 BuildRequires:  desktop-file-utils
 
 Requires:       gtk4 >= 4.14
-Requires:       libadwaita-1 >= 1.5
-Requires:       libsoup-3.0 >= 3.0
+Requires:       libadwaita >= 1.5
+Requires:       libsoup3 >= 3.0
 Requires:       libxml2 >= 2.9
 Requires:       sqlite-libs >= 3.30
-Requires:       ffmpeg
-Requires:       mpv
 Requires:       hicolor-icon-theme
+Requires:       /usr/bin/ffmpeg
 
 # Disable debuginfo package generation for standalone binary release
 %define debug_package %{nil}
@@ -42,6 +41,20 @@ meson compile -C rpmbuild_dir
 %install
 DESTDIR=%{buildroot} meson install -C rpmbuild_dir
 desktop-file-validate %{buildroot}%{_datadir}/applications/org.gnome.IptvPlayer.desktop
+
+%post
+/bin/touch --no-create %{_datadir}/icons/hicolor &>/dev/null || :
+update-desktop-database &>/dev/null || :
+
+%postun
+if [ $1 -eq 0 ] ; then
+    /bin/touch --no-create %{_datadir}/icons/hicolor &>/dev/null || :
+    gtk-update-icon-cache %{_datadir}/icons/hicolor &>/dev/null || :
+fi
+update-desktop-database &>/dev/null || :
+
+%posttrans
+gtk-update-icon-cache %{_datadir}/icons/hicolor &>/dev/null || :
 
 %files
 %{_bindir}/gnome-iptv
