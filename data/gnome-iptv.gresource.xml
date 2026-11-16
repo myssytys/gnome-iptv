@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/gnome/IptvPlayer">
+    <file>gnome-iptv.png</file>
+    <file alias="icons/16x16/apps/gnome-iptv.png">icons/hicolor/16x16/apps/gnome-iptv.png</file>
+    <file alias="icons/24x24/apps/gnome-iptv.png">icons/hicolor/24x24/apps/gnome-iptv.png</file>
+    <file alias="icons/32x32/apps/gnome-iptv.png">icons/hicolor/32x32/apps/gnome-iptv.png</file>
+    <file alias="icons/48x48/apps/gnome-iptv.png">icons/hicolor/48x48/apps/gnome-iptv.png</file>
+    <file alias="icons/64x64/apps/gnome-iptv.png">icons/hicolor/64x64/apps/gnome-iptv.png</file>
+    <file alias="icons/128x128/apps/gnome-iptv.png">icons/hicolor/128x128/apps/gnome-iptv.png</file>
+    <file alias="icons/256x256/apps/gnome-iptv.png">icons/hicolor/256x256/apps/gnome-iptv.png</file>
+    <file alias="icons/512x512/apps/gnome-iptv.png">icons/hicolor/512x512/apps/gnome-iptv.png</file>
+    <file alias="icons/16x16/apps/org.gnome.IptvPlayer.png">icons/hicolor/16x16/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/24x24/apps/org.gnome.IptvPlayer.png">icons/hicolor/24x24/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/32x32/apps/org.gnome.IptvPlayer.png">icons/hicolor/32x32/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/48x48/apps/org.gnome.IptvPlayer.png">icons/hicolor/48x48/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/64x64/apps/org.gnome.IptvPlayer.png">icons/hicolor/64x64/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/128x128/apps/org.gnome.IptvPlayer.png">icons/hicolor/128x128/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/256x256/apps/org.gnome.IptvPlayer.png">icons/hicolor/256x256/apps/org.gnome.IptvPlayer.png</file>
+    <file alias="icons/512x512/apps/org.gnome.IptvPlayer.png">icons/hicolor/512x512/apps/org.gnome.IptvPlayer.png</file>
+  </gresource>
+</gresources>

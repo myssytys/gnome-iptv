@@ -238,6 +238,9 @@ int run_self_test() {
 } // namespace
 
 int main(int argc, char** argv) {
+    g_set_prgname("org.gnome.IptvPlayer");
+    g_set_application_name("GNOME IPTV Player");
+
     std::string cli_m3u;
     std::string cli_epg;
     std::vector<char*> gtk_argv;

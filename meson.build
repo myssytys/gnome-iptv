@@ -29,8 +29,15 @@ sources = files(
   'src/services/tray_icon.cpp',
 )
 
+resources = gnome.compile_resources('gnome-iptv-resources',
+  'data/gnome-iptv.gresource.xml',
+  source_dir: 'data',
+  c_name: 'iptv'
+)
+
 executable('gnome-iptv',
   sources,
+  resources,
   include_directories: include_directories('src'),
   dependencies: [
     gtk4_dep,
@@ -45,5 +52,23 @@ executable('gnome-iptv',
 
 install_data('data/org.gnome.IptvPlayer.desktop',
   install_dir: get_option('datadir') / 'applications'
+)
+
+icon_sizes = ['16x16', '24x24', '32x32', '48x48', '64x64', '128x128', '256x256', '512x512']
+foreach size : icon_sizes
+  install_data('data/icons/hicolor' / size / 'apps/gnome-iptv.png',
+    install_dir: get_option('datadir') / 'icons/hicolor' / size / 'apps'
+  )
+  install_data('data/icons/hicolor' / size / 'apps/org.gnome.IptvPlayer.png',
+    install_dir: get_option('datadir') / 'icons/hicolor' / size / 'apps'
+  )
+endforeach
+
+install_data('data/gnome-iptv.png',
+  install_dir: get_option('datadir') / 'pixmaps'
+)
+
+install_data('data/org.gnome.IptvPlayer.png',
+  install_dir: get_option('datadir') / 'pixmaps'
 )
 

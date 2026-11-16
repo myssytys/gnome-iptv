@@ -1,10 +1,10 @@
 [Desktop Entry]
 Name=GNOME IPTV Player
 Comment=Watch and record HTTPS M3U IPTV streams with full XMLTV EPG support
-Exec=gnome-iptv
-Icon=video-television-symbolic
+Exec=gnome-iptv %U
+Icon=org.gnome.IptvPlayer
 Terminal=false
 Type=Application
 Categories=AudioVideo;Video;Player;TV;GTK;GNOME;
+StartupWMClass=org.gnome.IptvPlayer
 StartupNotify=true
-

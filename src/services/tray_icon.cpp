@@ -1,11 +1,13 @@
 #include "services/tray_icon.hpp"
 
+#include <gdk-pixbuf/gdk-pixbuf.h>
 #include <gio/gio.h>
 #include <glib.h>
 #include <unistd.h>
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace iptv {
 
@@ -132,8 +134,13 @@ struct TrayIcon::Impl {
     bool muted = false;
     std::string now_playing;
     guint32 menu_revision = 1;
+    GVariant* icon_pixmap_variant = nullptr;
 
     ~Impl() {
+        if (icon_pixmap_variant) {
+            g_variant_unref(icon_pixmap_variant);
+            icon_pixmap_variant = nullptr;
+        }
         if (watcher_watch_id > 0) {
             g_bus_unwatch_name(watcher_watch_id);
             watcher_watch_id = 0;
@@ -164,6 +171,55 @@ struct TrayIcon::Impl {
         }
     }
 
+    GVariant* load_icon_pixmap() const {
+        GVariantBuilder b;
+        g_variant_builder_init(&b, G_VARIANT_TYPE("a(iiay)"));
+
+        for (int size : {24, 32, 48}) {
+            std::string res_path = "/org/gnome/IptvPlayer/icons/" + std::to_string(size) + "x" +
+                                   std::to_string(size) + "/apps/gnome-iptv.png";
+            GError* err = nullptr;
+            GdkPixbuf* pb = gdk_pixbuf_new_from_resource(res_path.c_str(), &err);
+            if (!pb) {
+                if (err) g_error_free(err);
+                continue;
+            }
+
+            int w = gdk_pixbuf_get_width(pb);
+            int h = gdk_pixbuf_get_height(pb);
+            int n_channels = gdk_pixbuf_get_n_channels(pb);
+            int rowstride = gdk_pixbuf_get_rowstride(pb);
+            const guint8* pixels = gdk_pixbuf_get_pixels(pb);
+
+            std::vector<guint8> argb(static_cast<size_t>(w) * h * 4);
+            for (int y = 0; y < h; ++y) {
+                const guint8* row = pixels + y * rowstride;
+                for (int x = 0; x < w; ++x) {
+                    size_t out_idx = (static_cast<size_t>(y) * w + x) * 4;
+                    const guint8* px = row + x * n_channels;
+                    guint8 r = px[0];
+                    guint8 g = px[1];
+                    guint8 b = px[2];
+                    guint8 a = (n_channels >= 4) ? px[3] : 255;
+                    argb[out_idx + 0] = a;
+                    argb[out_idx + 1] = r;
+                    argb[out_idx + 2] = g;
+                    argb[out_idx + 3] = b;
+                }
+            }
+            g_object_unref(pb);
+
+            GVariant* byte_data = g_variant_new_fixed_array(
+                G_VARIANT_TYPE_BYTE,
+                argb.data(),
+                argb.size(),
+                sizeof(guint8));
+            g_variant_builder_add(&b, "(ii@ay)", w, h, byte_data);
+        }
+
+        return g_variant_builder_end(&b);
+    }
+
     void fill_item_properties(int id, GVariantBuilder* builder) const {
         if (id == 0) {
             g_variant_builder_add(builder, "{sv}", "children-display", g_variant_new_string("submenu"));
@@ -174,7 +230,7 @@ struct TrayIcon::Impl {
             g_variant_builder_add(builder, "{sv}", "label", g_variant_new_string(lbl));
             g_variant_builder_add(builder, "{sv}", "enabled", g_variant_new_boolean(TRUE));
             g_variant_builder_add(builder, "{sv}", "visible", g_variant_new_boolean(TRUE));
-            g_variant_builder_add(builder, "{sv}", "icon-name", g_variant_new_string("video-display-symbolic"));
+            g_variant_builder_add(builder, "{sv}", "icon-name", g_variant_new_string("gnome-iptv"));
             return;
         }
         if (id == 2) {
@@ -354,7 +410,7 @@ struct TrayIcon::Impl {
             return g_variant_new_boolean(FALSE);
         }
         if (std::strcmp(property_name, "IconName") == 0) {
-            return g_variant_new_string("video-display-symbolic");
+            return g_variant_new_string("gnome-iptv");
         }
         if (std::strcmp(property_name, "OverlayIconName") == 0 ||
             std::strcmp(property_name, "AttentionMovieName") == 0) {
@@ -363,8 +419,13 @@ struct TrayIcon::Impl {
         if (std::strcmp(property_name, "AttentionIconName") == 0) {
             return g_variant_new_string("media-record-symbolic");
         }
-        if (std::strcmp(property_name, "IconPixmap") == 0 ||
-            std::strcmp(property_name, "OverlayIconPixmap") == 0 ||
+        if (std::strcmp(property_name, "IconPixmap") == 0) {
+            if (!self->icon_pixmap_variant) {
+                self->icon_pixmap_variant = self->load_icon_pixmap();
+            }
+            return g_variant_ref(self->icon_pixmap_variant);
+        }
+        if (std::strcmp(property_name, "OverlayIconPixmap") == 0 ||
             std::strcmp(property_name, "AttentionIconPixmap") == 0) {
             GVariantBuilder b;
             g_variant_builder_init(&b, G_VARIANT_TYPE("a(iiay)"));

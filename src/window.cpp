@@ -480,6 +480,7 @@ struct MainWindow::Impl {
         window = ADW_APPLICATION_WINDOW(adw_application_window_new(GTK_APPLICATION(app)));
         gtk_window_set_title(GTK_WINDOW(window), "GNOME IPTV Player & Recorder");
         gtk_window_set_default_size(GTK_WINDOW(window), 1280, 820);
+        gtk_window_set_icon_name(GTK_WINDOW(window), "org.gnome.IptvPlayer");
 
         toast_overlay = ADW_TOAST_OVERLAY(adw_toast_overlay_new());
         split_view = ADW_NAVIGATION_SPLIT_VIEW(adw_navigation_split_view_new());
@@ -489,6 +490,13 @@ struct MainWindow::Impl {
         // ================= SIDEBAR PAGE =================
         AdwToolbarView* sidebar_toolbar = ADW_TOOLBAR_VIEW(adw_toolbar_view_new());
         AdwHeaderBar* sidebar_header = ADW_HEADER_BAR(adw_header_bar_new());
+
+        GtkWidget* app_icon = gtk_image_new_from_icon_name("org.gnome.IptvPlayer");
+        gtk_image_set_pixel_size(GTK_IMAGE(app_icon), 24);
+        gtk_widget_set_margin_start(app_icon, 6);
+        gtk_widget_set_margin_end(app_icon, 4);
+        gtk_widget_set_tooltip_text(app_icon, "GNOME IPTV Player & Recorder");
+        adw_header_bar_pack_start(sidebar_header, app_icon);
 
         GtkWidget* open_file_btn = gtk_button_new_from_icon_name("document-open-symbolic");
         gtk_widget_set_tooltip_text(open_file_btn, "Open Local .m3u / .m3u8 File...");

@@ -8,3 +8,5 @@ build/
 *.swp
 *~
 .DS_Store
+packaging/rpmbuild/
+*.rpm
