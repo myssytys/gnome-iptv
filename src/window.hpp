@@ -6,6 +6,7 @@
 #include "services/m3u_parser.hpp"
 #include "services/stream_player.hpp"
 #include "services/stream_recorder.hpp"
+#include "services/tray_icon.hpp"
 
 #include <adwaita.h>
 #include <string>

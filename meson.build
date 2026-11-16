@@ -26,6 +26,7 @@ sources = files(
   'src/services/epg_manager.cpp',
   'src/services/stream_player.cpp',
   'src/services/stream_recorder.cpp',
+  'src/services/tray_icon.cpp',
 )
 
 executable('gnome-iptv',

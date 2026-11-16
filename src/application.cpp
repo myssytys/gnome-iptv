@@ -5,7 +5,7 @@ namespace iptv {
 
 Application::Application(const std::string& cli_m3u, const std::string& cli_epg)
     : cli_m3u_(cli_m3u), cli_epg_(cli_epg) {
-    app_ = adw_application_new("org.gnome.IptvPlayer", G_APPLICATION_NON_UNIQUE);
+    app_ = adw_application_new("org.gnome.IptvPlayer", G_APPLICATION_DEFAULT_FLAGS);
 
     g_signal_connect(
         app_, "activate",

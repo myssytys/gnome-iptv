@@ -51,6 +51,9 @@ struct MainWindow::Impl {
     EpgManager* epg_manager = nullptr;
     StreamPlayer player;
     StreamRecorder recorder;
+    TrayIcon tray_icon;
+    bool app_held = false;
+    bool quitting_app = false;
 
     // Data state (file-offset indexed; channels are loaded into memory only as they approach the scroller)
     static constexpr size_t SCROLLER_BATCH_SIZE = 60;
@@ -135,6 +138,12 @@ struct MainWindow::Impl {
 
         build_ui();
         wire_callbacks();
+        init_tray_icon();
+
+        if (app && !app_held) {
+            g_application_hold(G_APPLICATION(app));
+            app_held = true;
+        }
 
         // Start periodic EPG refresh timer
         epg_manager->configure_auto_update(config.epg_url, config.epg_update_interval_minutes);
@@ -173,9 +182,97 @@ struct MainWindow::Impl {
             g_source_remove(epg_ui_tick_id);
             epg_ui_tick_id = 0;
         }
+        if (app && app_held) {
+            g_application_release(G_APPLICATION(app));
+            app_held = false;
+        }
         player.stop();
         recorder.stop_recording();
         delete epg_manager;
+    }
+
+    void minimize_to_tray() {
+        if (!window) return;
+        if (is_fullscreen) {
+            set_fullscreen(false);
+        }
+        gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
+        tray_icon.update_state(false, effective_volume() <= 0.005,
+                               has_selected_channel ? selected_channel.name : "");
+    }
+
+    void restore_from_tray() {
+        if (!window) return;
+        gtk_widget_set_visible(GTK_WIDGET(window), TRUE);
+        gtk_window_present(GTK_WINDOW(window));
+        tray_icon.update_state(true, effective_volume() <= 0.005,
+                               has_selected_channel ? selected_channel.name : "");
+    }
+
+    void toggle_tray_window() {
+        if (!window) return;
+        if (gtk_widget_get_visible(GTK_WIDGET(window))) {
+            minimize_to_tray();
+        } else {
+            restore_from_tray();
+        }
+    }
+
+    void quit_application() {
+        quitting_app = true;
+        player.stop();
+        recorder.stop_recording();
+        if (app && app_held) {
+            g_application_release(G_APPLICATION(app));
+            app_held = false;
+        }
+        if (window) {
+            gtk_window_destroy(GTK_WINDOW(window));
+            window = nullptr;
+        }
+        if (app) {
+            g_application_quit(G_APPLICATION(app));
+        }
+    }
+
+    void init_tray_icon() {
+        TrayIcon::Callbacks cbs;
+        cbs.on_toggle_window = [this]() {
+            toggle_tray_window();
+        };
+        cbs.on_show_window = [this]() {
+            restore_from_tray();
+        };
+        cbs.on_toggle_mute = [this]() {
+            if (mute_btn) {
+                gboolean cur = gtk_toggle_button_get_active(mute_btn);
+                gtk_toggle_button_set_active(mute_btn, !cur);
+            }
+            tray_icon.update_state(
+                window && gtk_widget_get_visible(GTK_WIDGET(window)),
+                effective_volume() <= 0.005,
+                has_selected_channel ? selected_channel.name : "");
+        };
+        cbs.on_stop_playback = [this]() {
+            player.stop();
+            tray_icon.update_state(
+                window && gtk_widget_get_visible(GTK_WIDGET(window)),
+                effective_volume() <= 0.005,
+                "");
+        };
+        cbs.on_quit = [this]() {
+            quit_application();
+        };
+        cbs.on_scroll_volume = [this](int dir) {
+            double step = (dir > 0) ? 0.05 : -0.05;
+            set_audio_volume_from_knob(effective_volume() + step);
+            tray_icon.update_state(
+                window && gtk_widget_get_visible(GTK_WIDGET(window)),
+                effective_volume() <= 0.005,
+                has_selected_channel ? selected_channel.name : "");
+        };
+        tray_icon.start(std::move(cbs));
+        tray_icon.update_state(true, effective_volume() <= 0.005, "");
     }
 
     void show_toast(const std::string& text) {
@@ -469,6 +566,15 @@ struct MainWindow::Impl {
                     });
             }),
             this);
+        GtkWidget* quit_btn = gtk_button_new_from_icon_name("application-exit-symbolic");
+        gtk_widget_set_tooltip_text(quit_btn, "Quit GNOME IPTV Completely (Ctrl+Q)");
+        g_signal_connect(
+            quit_btn, "clicked",
+            G_CALLBACK(+[](GtkButton*, gpointer data) {
+                static_cast<Impl*>(data)->quit_application();
+            }),
+            this);
+        adw_header_bar_pack_end(sidebar_header, quit_btn);
         adw_header_bar_pack_end(sidebar_header, prefs_btn);
         adw_toolbar_view_add_top_bar(sidebar_toolbar, GTK_WIDGET(sidebar_header));
 
@@ -1136,8 +1242,12 @@ struct MainWindow::Impl {
         GtkEventController* key_ctrl = gtk_event_controller_key_new();
         g_signal_connect(
             key_ctrl, "key-pressed",
-            G_CALLBACK((+[](GtkEventControllerKey*, guint keyval, guint, GdkModifierType, gpointer data) -> gboolean {
+            G_CALLBACK((+[](GtkEventControllerKey*, guint keyval, guint, GdkModifierType state, gpointer data) -> gboolean {
                 auto* self = static_cast<Impl*>(data);
+                if ((state & GDK_CONTROL_MASK) && (keyval == GDK_KEY_q || keyval == GDK_KEY_Q)) {
+                    self->quit_application();
+                    return TRUE;
+                }
                 if (keyval == GDK_KEY_F11) {
                     self->toggle_fullscreen();
                     return TRUE;
@@ -1173,6 +1283,20 @@ struct MainWindow::Impl {
                 auto* self = static_cast<Impl*>(data);
                 gboolean full = gtk_window_is_fullscreen(GTK_WINDOW(obj));
                 self->on_fullscreen_state_changed(full != FALSE);
+            }),
+            this);
+
+        // Intercept the upper-right X close button so the window minimizes to the system tray
+        // and stays running in the tray until the user explicitly quits.
+        g_signal_connect(
+            window, "close-request",
+            G_CALLBACK(+[](GtkWindow*, gpointer data) -> gboolean {
+                auto* self = static_cast<Impl*>(data);
+                if (self->quitting_app) {
+                    return FALSE;
+                }
+                self->minimize_to_tray();
+                return TRUE;
             }),
             this);
     }
@@ -1441,6 +1565,10 @@ struct MainWindow::Impl {
         gtk_label_set_text(active_channel_title, (ch.name + " [" + ch.group + "]").c_str());
         player.play_channel(ch);
         update_active_channel_epg_ui();
+        tray_icon.update_state(
+            window && gtk_widget_get_visible(GTK_WIDGET(window)),
+            effective_volume() <= 0.005,
+            ch.name);
     }
 
     void render_browsed_epg_card() {
@@ -1705,7 +1833,7 @@ GtkWindow* MainWindow::gtk_window() const {
 }
 
 void MainWindow::present() {
-    gtk_window_present(GTK_WINDOW(impl_->window));
+    impl_->restore_from_tray();
 }
 
 } // namespace iptv
