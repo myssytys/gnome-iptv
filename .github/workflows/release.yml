@@ -1,0 +1,53 @@
+name: Release RPM
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Fedora build dependencies
+        run: |
+          dnf install -y \
+            gcc-c++ \
+            meson \
+            ninja-build \
+            desktop-file-utils \
+            rpm-build \
+            pkgconfig(gtk4) \
+            pkgconfig(libadwaita-1) \
+            pkgconfig(libsoup-3.0) \
+            pkgconfig(libxml-2.0) \
+            pkgconfig(sqlite3)
+
+      - name: Build RPM packages
+        run: |
+          mkdir -p rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          tar --transform 's,^\.,gnome-iptv-1.0.0,' \
+              --exclude='./rpmbuild' \
+              --exclude='./.git' \
+              -czf rpmbuild/SOURCES/gnome-iptv-1.0.0.tar.gz .
+          cp packaging/gnome-iptv.spec rpmbuild/SPECS/
+          rpmbuild --define "_topdir $PWD/rpmbuild" -ba rpmbuild/SPECS/gnome-iptv.spec
+          mkdir -p dist
+          cp rpmbuild/RPMS/*/*.rpm dist/
+          cp rpmbuild/SRPMS/*.rpm dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*.rpm
+          name: "GNOME IPTV Player & Recorder ${{ github.ref_name }}"
+          generate_release_notes: true
