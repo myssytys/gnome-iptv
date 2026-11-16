@@ -44,7 +44,7 @@ struct PrefsState {
         }
         if (rec_fmt_row) {
             guint sel = adw_combo_row_get_selected(rec_fmt_row);
-            cfg.recording_format = (sel == 1) ? "mkv" : "ts";
+            cfg.recording_format = (sel == 1) ? "ts" : "mkv";
         }
     }
 };
@@ -177,13 +177,13 @@ void PreferencesDialog::present(GtkWindow* parent, const AppConfig& current_cfg,
     gtk_editable_set_text(GTK_EDITABLE(st->rec_dir_row), current_cfg.recording_dir.c_str());
     adw_preferences_group_add(rec_grp, GTK_WIDGET(st->rec_dir_row));
 
-    const char* formats[] = {"MPEG-TS (.ts) — Crash & Reconnect Safe", "Matroska (.mkv) — Auto-Remux on Stop", nullptr};
+    const char* formats[] = {"Matroska (.mkv) — Record .ts & Auto-Remux to .mkv on Stop", "MPEG-TS (.ts) — Keep Raw .ts Without Remuxing", nullptr};
     GtkStringList* fmt_model = gtk_string_list_new(formats);
     st->rec_fmt_row = ADW_COMBO_ROW(adw_combo_row_new());
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(st->rec_fmt_row), "Container Format");
     adw_combo_row_set_model(st->rec_fmt_row, G_LIST_MODEL(fmt_model));
     g_object_unref(fmt_model);
-    adw_combo_row_set_selected(st->rec_fmt_row, (current_cfg.recording_format == "mkv") ? 1 : 0);
+    adw_combo_row_set_selected(st->rec_fmt_row, (current_cfg.recording_format == "ts") ? 1 : 0);
     adw_preferences_group_add(rec_grp, GTK_WIDGET(st->rec_fmt_row));
 
     adw_preferences_page_add(page, rec_grp);

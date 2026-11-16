@@ -189,7 +189,7 @@ int run_self_test() {
 
     iptv::AppConfig test_cfg;
     test_cfg.recording_dir = "/tmp/gnome-iptv-rec-test";
-    test_cfg.recording_format = "ts";
+    test_cfg.recording_format = "mkv";
     test_cfg.auto_reconnect = true;
     test_cfg.reconnect_delay_seconds = 1;
     test_cfg.watchdog_timeout_seconds = 4;
@@ -216,20 +216,26 @@ int run_self_test() {
         g_usleep(20000);
     }
 
-    auto stats = recorder.current_stats();
+    auto active_stats = recorder.current_stats();
     recorder.stop_recording();
+    auto final_stats = recorder.current_stats();
     g_unlink(test_src.c_str());
 
-    if (stats.bytes_written == 0 || stats.reconnect_attempts < 1) {
+    if (active_stats.bytes_written == 0 || active_stats.reconnect_attempts < 1) {
         std::cerr << "[FAIL] Expected bytes_written > 0 and reconnect_attempts >= 1, got bytes="
-                  << stats.bytes_written << ", reconnects=" << stats.reconnect_attempts << "\n";
+                  << active_stats.bytes_written << ", reconnects=" << active_stats.reconnect_attempts << "\n";
         return 1;
     }
-    std::cout << "  -> Recorded " << stats.bytes_written << " bytes across "
-              << (stats.reconnect_attempts + 1) << " connection(s) (auto-reconnected "
-              << stats.reconnect_attempts << " time(s) after stream break) -> "
-              << stats.output_path << "\n";
-    g_unlink(stats.output_path.c_str());
+    if (!final_stats.output_path.ends_with(".mkv") ||
+        !g_file_test(final_stats.output_path.c_str(), G_FILE_TEST_EXISTS)) {
+        std::cerr << "[FAIL] Expected remuxed .mkv file to exist at " << final_stats.output_path << "\n";
+        return 1;
+    }
+    std::cout << "  -> Recorded " << active_stats.bytes_written << " bytes across "
+              << (active_stats.reconnect_attempts + 1) << " connection(s) (auto-reconnected "
+              << active_stats.reconnect_attempts << " time(s) after stream break) & remuxed to -> "
+              << final_stats.output_path << "\n";
+    g_unlink(final_stats.output_path.c_str());
 
     std::cout << "[Self-Test] ALL TESTS PASSED.\n";
     return 0;

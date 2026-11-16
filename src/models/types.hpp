@@ -46,7 +46,7 @@ struct AppConfig {
     std::string m3u_url;
     std::string epg_url;
     std::string recording_dir;
-    std::string recording_format = "ts"; // "ts" or "mkv"
+    std::string recording_format = "mkv"; // "mkv" (record .ts and remux to .mkv on finish) or "ts"
     int epg_update_interval_minutes = 15;
     int reconnect_delay_seconds = 2;
     int watchdog_timeout_seconds = 10;

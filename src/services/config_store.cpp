@@ -84,9 +84,7 @@ AppConfig ConfigStore::load() const {
     if (cfg.watchdog_timeout_seconds < 3) cfg.watchdog_timeout_seconds = 10;
     if (cfg.volume < 0.0) cfg.volume = 0.0;
     if (cfg.volume > 1.0) cfg.volume = 1.0;
-    if (cfg.recording_format != "mkv" && cfg.recording_format != "ts") {
-        cfg.recording_format = "ts";
-    }
+    cfg.recording_format = "mkv";
     g_mkdir_with_parents(cfg.recording_dir.c_str(), 0755);
     return cfg;
 }

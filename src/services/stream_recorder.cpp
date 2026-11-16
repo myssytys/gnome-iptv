@@ -290,7 +290,6 @@ struct StreamRecorder::Impl {
         }
 
         std::string finished_path;
-        std::string target_format;
         {
             std::lock_guard<std::mutex> lock(mtx);
             if (proc) {
@@ -303,26 +302,37 @@ struct StreamRecorder::Impl {
                 out_stream.close();
             }
             finished_path = current_output_path;
-            target_format = config.recording_format;
             status_text = "Recording saved to " + finished_path;
         }
 
-        // If user selected MKV format, remux the captured .ts stream into .mkv
-        if (target_format == "mkv" && finished_path.ends_with(".mkv")) {
-            std::string tmp_ts = finished_path + ".part.ts";
-            if (g_file_test(finished_path.c_str(), G_FILE_TEST_EXISTS)) {
-                g_rename(finished_path.c_str(), tmp_ts.c_str());
-                const char* remux_argv[] = {
-                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", tmp_ts.c_str(), "-c", "copy", finished_path.c_str(), nullptr
-                };
-                GSubprocess* remux = g_subprocess_newv(remux_argv, G_SUBPROCESS_FLAGS_NONE, nullptr);
-                if (remux) {
-                    g_subprocess_wait(remux, nullptr, nullptr);
-                    g_object_unref(remux);
-                    g_unlink(tmp_ts.c_str());
+        // Always remux the finished .ts stream into a .mkv file with ffmpeg
+        if (finished_path.ends_with(".ts") && bytes_written.load() > 0 &&
+            g_file_test(finished_path.c_str(), G_FILE_TEST_EXISTS)) {
+            std::string mkv_path = finished_path.substr(0, finished_path.size() - 3) + ".mkv";
+            const char* remux_argv[] = {
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-fflags", "+genpts+discardcorrupt",
+                "-i", finished_path.c_str(),
+                "-map", "0:v?",
+                "-map", "0:a?",
+                "-map", "0:s?",
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                mkv_path.c_str(),
+                nullptr
+            };
+            GSubprocess* remux = g_subprocess_newv(remux_argv, G_SUBPROCESS_FLAGS_NONE, nullptr);
+            if (remux) {
+                gboolean ok = g_subprocess_wait_check(remux, nullptr, nullptr);
+                g_object_unref(remux);
+                GStatBuf st_buf{};
+                if (ok && g_stat(mkv_path.c_str(), &st_buf) == 0 && st_buf.st_size > 0) {
+                    g_unlink(finished_path.c_str());
+                    std::lock_guard<std::mutex> lock(mtx);
+                    current_output_path = mkv_path;
+                    status_text = "Recording remuxed and saved to " + mkv_path;
                 } else {
-                    g_rename(tmp_ts.c_str(), finished_path.c_str());
+                    g_unlink(mkv_path.c_str());
                 }
             }
         }
@@ -393,11 +403,9 @@ struct StreamRecorder::Impl {
         }
 
         std::string rec_dir;
-        std::string ext;
         {
             std::lock_guard<std::mutex> lock(mtx);
             rec_dir = config.recording_dir;
-            ext = (config.recording_format == "mkv") ? ".mkv" : ".ts";
         }
         if (rec_dir.empty()) rec_dir = "/tmp";
         g_mkdir_with_parents(rec_dir.c_str(), 0755);
@@ -412,7 +420,7 @@ struct StreamRecorder::Impl {
         if (!programme_title.empty()) {
             base_name += "_" + sanitize_filename(programme_title);
         }
-        std::string full_path = rec_dir + "/" + base_name + "_" + ts_oss.str() + ext;
+        std::string full_path = rec_dir + "/" + base_name + "_" + ts_oss.str() + ".ts";
 
         int gen = session_generation.fetch_add(1) + 1;
         {
